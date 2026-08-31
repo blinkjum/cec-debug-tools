@@ -1,0 +1,26 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime output
+*.log
+outputs/
+work/
+
+# Local libCEC/CMake build products
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+libcec-custom-install/
+libcec-upstream/build*/
+src/
+
+# IDE and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
