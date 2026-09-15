@@ -144,6 +144,109 @@ OPCODE_CATALOG_OPTIONS = [(f"{opcode:02X}", guide[0]) for opcode, guide in sorte
 HIGHLIGHT_OPCODE_OPTIONS = [("", "不高亮"), *OPCODE_CATALOG_OPTIONS]
 
 
+# CEC User Control Code values carried as the single operand of
+# User Control Pressed (0x44).  Keep this table in the GUI instead of using a
+# small hand-written subset so that a captured frame is decoded consistently
+# with libCEC's cec_user_control_code enum.  The raw value is still displayed
+# by the decoder; these labels are only an interpretation of that byte.
+USER_CONTROL_CODE_NAMES: dict[int, str] = {
+    0x00: "Select（选择）",
+    0x01: "Up（上）",
+    0x02: "Down（下）",
+    0x03: "Left（左）",
+    0x04: "Right（右）",
+    0x05: "Right-Up（右上）",
+    0x06: "Right-Down（右下）",
+    0x07: "Left-Up（左上）",
+    0x08: "Left-Down（左下）",
+    0x09: "Root Menu（根菜单）",
+    0x0A: "Setup Menu（设置菜单）",
+    0x0B: "Contents Menu（内容菜单）",
+    0x0C: "Favorite Menu（收藏夹菜单）",
+    0x0D: "Exit（退出）",
+    0x10: "Top Menu（顶层菜单）",
+    0x11: "DVD Menu（DVD 菜单）",
+    0x1D: "Number Entry Mode（数字输入模式）",
+    0x1E: "Number 11（数字 11）",
+    0x1F: "Number 12（数字 12）",
+    **{0x20 + number: f"Number {number}（数字 {number}）" for number in range(10)},
+    0x2A: "Dot（点号）",
+    0x2B: "Enter（确认/回车）",
+    0x2C: "Clear（清除）",
+    0x2F: "Next Favorite（下一个收藏）",
+    0x30: "Channel Up（频道加）",
+    0x31: "Channel Down（频道减）",
+    0x32: "Previous Channel（上一个频道）",
+    0x33: "Sound Select（声音选择）",
+    0x34: "Input Select（输入选择）",
+    0x35: "Display Information（显示信息）",
+    0x36: "Help（帮助）",
+    0x37: "Page Up（上一页）",
+    0x38: "Page Down（下一页）",
+    0x40: "Power（电源）",
+    0x41: "Volume Up（音量加）",
+    0x42: "Volume Down（音量减）",
+    0x43: "Mute（静音）",
+    0x44: "Play（播放）",
+    0x45: "Stop（停止）",
+    0x46: "Pause（暂停）",
+    0x47: "Record（录制）",
+    0x48: "Rewind（倒回）",
+    0x49: "Fast Forward（快进）",
+    0x4A: "Eject（弹出）",
+    0x4B: "Forward（前进）",
+    0x4C: "Backward（后退）",
+    0x4D: "Stop Record（停止录制）",
+    0x4E: "Pause Record（暂停录制）",
+    0x50: "Angle（角度）",
+    0x51: "Sub-picture（子画面）",
+    0x52: "Video on Demand（视频点播）",
+    0x53: "Electronic Program Guide（电子节目指南）",
+    0x54: "Timer Programming（定时器编程）",
+    0x55: "Initial Configuration（初始配置）",
+    0x56: "Select Broadcast Type（选择广播类型）",
+    0x57: "Select Sound Presentation（选择声音呈现方式）",
+    0x60: "Play Function（播放功能）",
+    0x61: "Pause Play Function（暂停播放功能）",
+    0x62: "Record Function（录制功能）",
+    0x63: "Pause Record Function（暂停录制功能）",
+    0x64: "Stop Function（停止功能）",
+    0x65: "Mute Function（静音功能）",
+    0x66: "Restore Volume Function（恢复音量功能）",
+    0x67: "Tune Function（调谐功能）",
+    0x68: "Select Media Function（选择媒体功能）",
+    0x69: "Select AV Input Function（选择 AV 输入功能）",
+    0x6A: "Select Audio Input Function（选择音频输入功能）",
+    0x6B: "Power Toggle Function（电源切换功能）",
+    0x6C: "Power Off Function（关机功能）",
+    0x6D: "Power On Function（开机功能）",
+    0x71: "F1 Blue（F1 蓝色）",
+    0x72: "F2 Red（F2 红色）",
+    0x73: "F3 Green（F3 绿色）",
+    0x74: "F4 Yellow（F4 黄色）",
+    0x75: "F5",
+    0x76: "Data（数据）",
+    0x91: "Return（返回，Samsung 扩展）",
+    0x96: "Channels List（频道列表，Samsung 扩展）",
+}
+
+# Values marked reserved by libCEC's cec_user_control_code definition.  They
+# are different from an implementation that simply has not recognized a
+# value, so report them separately in the monitor.
+USER_CONTROL_CODE_RESERVED = frozenset(
+    {
+        *range(0x0E, 0x10),
+        *range(0x12, 0x1D),
+        *range(0x2D, 0x2F),
+        *range(0x39, 0x40),
+        0x4F,
+        *range(0x58, 0x60),
+        *range(0x6E, 0x71),
+        *range(0x77, 0x100),
+    }
+) - USER_CONTROL_CODE_NAMES.keys()
+
+
 def _log_level_options() -> list[tuple[str, str]]:
     bit_names = ((1, "Error"), (2, "Warning"), (4, "Notice"), (8, "Traffic"), (16, "Debug"))
     options: list[tuple[str, str]] = []
@@ -292,6 +395,7 @@ class CaptureTable(ttk.Frame):
         self._headings: dict[str, str] = {column: column for column in self.columns}
         self._widths: dict[str, int] = {column: 100 for column in self.columns}
         self._items: dict[str, dict[str, object]] = {}
+        self._row_heights: dict[str, int] = {}
         self._order: list[str] = []
         self._tags: dict[str, dict[str, object]] = {}
         self._selection: tuple[str, ...] = ()
@@ -299,7 +403,8 @@ class CaptureTable(ttk.Frame):
         self._next_item = 1
         self._batch_depth = 0
         self._header_height = 28
-        self._row_height = 27
+        self._base_row_height = 27
+        self._wrap_columns = {"opcode_explanation", "params_explanation"}
         self._font = tkfont.nametofont("TkDefaultFont")
         self._header_font = self._font.copy()
         self._header_font.configure(weight="bold")
@@ -378,18 +483,26 @@ class CaptureTable(ttk.Frame):
         item_id = f"capture{self._next_item}"
         self._next_item += 1
         self._items[item_id] = {"values": tuple(values), "tags": tuple(tags)}
+        self._row_heights[item_id] = self._measure_row_height(item_id)
         self._order.append(item_id)
         if self._batch_depth == 0:
-            self._draw_body_row(item_id, len(self._order) - 1)
+            y0 = sum(self._row_heights[value] for value in self._order[:-1])
+            self._draw_body_row(item_id, y0)
             self._update_scrollregion()
         return item_id
 
     def delete(self, *items: str) -> None:
         existing = [item_id for item_id in items if item_id in self._items]
         single_index = self._order.index(existing[0]) if len(existing) == 1 else None
+        removed_height = (
+            self._row_heights.get(existing[0], self._base_row_height)
+            if single_index is not None
+            else self._base_row_height
+        )
         for item_id in items:
             if item_id in self._items:
                 del self._items[item_id]
+                self._row_heights.pop(item_id, None)
                 self._order.remove(item_id)
         self._selection = tuple(item for item in self._selection if item in self._items)
         if self._focus_item not in self._items:
@@ -399,7 +512,7 @@ class CaptureTable(ttk.Frame):
                 removed_item = existing[0]
                 self.body_canvas.delete(f"capture_item_{removed_item}")
                 for item_id in self._order[single_index:]:
-                    self.body_canvas.move(f"capture_item_{item_id}", 0, -self._row_height)
+                    self.body_canvas.move(f"capture_item_{item_id}", 0, -removed_height)
                 self._update_scrollregion()
             elif existing:
                 self._redraw()
@@ -430,8 +543,13 @@ class CaptureTable(ttk.Frame):
         return self._focus_item or ""
 
     def identify_row(self, y: int) -> str:
-        index = int(self.body_canvas.canvasy(y) // self._row_height)
-        return self._order[index] if 0 <= index < len(self._order) else ""
+        position = self.body_canvas.canvasy(y)
+        offset = 0
+        for item_id in self._order:
+            offset += self._row_heights.get(item_id, self._base_row_height)
+            if position < offset:
+                return item_id
+        return ""
 
     def identify_column(self, x: int) -> str:
         position = self.body_canvas.canvasx(x)
@@ -489,6 +607,8 @@ class CaptureTable(ttk.Frame):
         self.header_canvas.delete("all")
         self.body_canvas.delete("all")
         self.header_canvas.configure(scrollregion=(0, 0, total_width, self._header_height))
+        for item_id in self._order:
+            self._row_heights[item_id] = self._measure_row_height(item_id)
         self._update_scrollregion()
 
         offset = 0
@@ -498,18 +618,51 @@ class CaptureTable(ttk.Frame):
             self.header_canvas.create_text(offset + 5, self._header_height / 2, text=self._headings[column], anchor="w", font=self._header_font, fill="#202020")
             offset += width
 
-        for row_index, item_id in enumerate(self._order):
-            self._draw_body_row(item_id, row_index)
+        offset_y = 0
+        for item_id in self._order:
+            self._draw_body_row(item_id, offset_y)
+            offset_y += self._row_heights.get(item_id, self._base_row_height)
 
         first = self.body_canvas.xview()[0]
         self.header_canvas.xview_moveto(first)
 
     def _update_scrollregion(self) -> None:
         total_width = sum(self._widths[column] for column in self.columns)
-        total_height = len(self._order) * self._row_height
+        total_height = sum(self._row_heights.get(item_id, self._base_row_height) for item_id in self._order)
         self.body_canvas.configure(scrollregion=(0, 0, total_width, total_height))
 
-    def _draw_body_row(self, item_id: str, row_index: int) -> None:
+    def _wrap_text(self, value: object, width: int) -> str:
+        """Wrap text by rendered width, including CJK text without spaces."""
+        text = str(value)
+        if not text or width <= 1:
+            return text
+        lines: list[str] = []
+        paragraphs = text.splitlines() or [""]
+        for paragraph in paragraphs:
+            current = ""
+            for character in paragraph:
+                candidate = current + character
+                if current and self._font.measure(candidate) > width:
+                    lines.append(current)
+                    current = character
+                else:
+                    current = candidate
+            lines.append(current)
+        return "\n".join(lines)
+
+    def _measure_row_height(self, item_id: str) -> int:
+        data = self._items.get(item_id, {})
+        values = tuple(data.get("values", ()))
+        max_lines = 1
+        for value_index, column in enumerate(self.columns):
+            if column not in self._wrap_columns or value_index >= len(values):
+                continue
+            wrapped = self._wrap_text(values[value_index], max(20, self._widths[column] - 10))
+            max_lines = max(max_lines, wrapped.count("\n") + 1)
+        line_height = int(self._font.metrics("linespace"))
+        return max(self._base_row_height, max_lines * line_height + 8)
+
+    def _draw_body_row(self, item_id: str, y0: int) -> None:
         data = self._items[item_id]
         values = tuple(data.get("values", ()))
         tags = tuple(data.get("tags", ()))
@@ -525,8 +678,8 @@ class CaptureTable(ttk.Frame):
             "",
         )
         highlighted = bool(highlight_tag) and not selected
-        y0 = row_index * self._row_height
-        y1 = y0 + self._row_height
+        row_height = self._row_heights.get(item_id, self._base_row_height)
+        y1 = y0 + row_height
         offset = 0
         canvas_tags = ("capture_row", f"capture_item_{item_id}")
         for value_index, column in enumerate(self.columns):
@@ -544,9 +697,17 @@ class CaptureTable(ttk.Frame):
                 fill=cell_background, outline=cell_outline, tags=canvas_tags,
             )
             value = str(values[value_index]) if value_index < len(values) else ""
+            if column in self._wrap_columns:
+                value = self._wrap_text(value, max(20, width - 10))
+                text_anchor = "nw"
+                text_y = y0 + 4
+            else:
+                text_anchor = "w"
+                text_y = y0 + row_height / 2
             self.body_canvas.create_text(
-                offset + 5, y0 + self._row_height / 2,
-                text=value, anchor="w", font=self._font, fill=cell_foreground, tags=canvas_tags,
+                offset + 5, text_y,
+                text=value, anchor=text_anchor, font=self._font, fill=cell_foreground,
+                justify="left", tags=canvas_tags,
             )
             offset += width
 
@@ -1392,25 +1553,36 @@ class CECClientGUI(tk.Tk):
             foreground="#1F3B53",
             anchor=W,
         ).grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            interval_frame,
+            text="理论帧时长 = Start 4.5 ms + 每字节 24.0 ms；不含总线空闲、重试和响应等待",
+            foreground="#666666",
+            anchor=W,
+        ).grid(row=1, column=0, sticky="ew", pady=(2, 0))
 
         frame = ttk.Frame(parent)
         frame.grid(row=3, column=0, sticky="nsew")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         columns = (
-            "seq", "time", "direction", "source", "destination", "frame",
+            "seq", "time", "source", "destination", "frame",
+            "theoretical_duration_ms", "callback_interval_ms", "estimated_gap_ms",
             "opcode", "opcode_explanation", "params", "params_explanation", "status",
         )
         self.capture_tree = CaptureTable(frame, columns=columns)
         headings = {
-            "seq": "#", "time": "时间", "direction": "方向", "source": "Source",
-            "destination": "Destination", "frame": "报文", "opcode": "Opcode",
+            "seq": "#", "time": "时间", "source": "Source",
+            "destination": "Destination", "frame": "报文",
+            "theoretical_duration_ms": "理论帧时长", "callback_interval_ms": "相邻回调间隔",
+            "estimated_gap_ms": "回调间隔−本帧理论", "opcode": "Opcode",
             "opcode_explanation": "Opcode 解释", "params": "参数",
             "params_explanation": "参数解释", "status": "ACK 状态",
         }
         widths = {
-            "seq": 55, "time": 115, "direction": 60, "source": 70,
-            "destination": 90, "frame": 180, "opcode": 190,
+            "seq": 55, "time": 115, "source": 70,
+            "destination": 90, "frame": 180,
+            "theoretical_duration_ms": 110, "callback_interval_ms": 120,
+            "estimated_gap_ms": 125, "opcode": 190,
             "opcode_explanation": 340, "params": 180, "params_explanation": 420, "status": 145,
         }
         for column in columns:
@@ -2425,6 +2597,25 @@ class CECClientGUI(tk.Tk):
             return self._format_ui_time_ms()
 
     @staticmethod
+    def _capture_theoretical_duration_ms(frame: list[int]) -> float:
+        """Return the nominal on-wire duration of one CEC frame.
+
+        A CEC frame consists of a 4.5 ms nominal start bit followed by one
+        10-bit header/data block per raw byte.  Each block has a nominal
+        2.4 ms bit period, including EOM and ACK/NACK.  ``frame`` includes
+        the header byte, so a polling frame has one byte and no opcode.
+        This is a protocol calculation, not an edge timestamp measured from
+        the adapter's physical CEC line.
+        """
+        return round(4.5 + len(frame) * 10 * 2.4, 1)
+
+    @staticmethod
+    def _capture_duration_text(value: object) -> str:
+        if isinstance(value, (int, float)):
+            return f"{float(value):.1f} ms"
+        return "—"
+
+    @staticmethod
     def _capture_status_text(direction: str, frame: list[int], event: dict[str, object]) -> str:
         """Return the ACK result shown in the capture table.
 
@@ -2476,12 +2667,28 @@ class CECClientGUI(tk.Tk):
         source = (frame[0] >> 4) & 0x0F
         destination = frame[0] & 0x0F
         opcode = frame[1] if len(frame) > 1 else None
+        theoretical_duration_ms = self._capture_theoretical_duration_ms(frame)
+        previous_record = self.capture_records[-1] if self.capture_records else None
+        callback_interval_ms: float | None = None
+        estimated_gap_ms: float | None = None
+        if previous_record is not None and isinstance(raw_timestamp_ms, (int, float)):
+            previous_timestamp = previous_record.get("timestamp_ms")
+            if isinstance(previous_timestamp, (int, float)):
+                callback_interval_ms = round(float(raw_timestamp_ms) - float(previous_timestamp), 1)
+                # Compare with the current row's theoretical duration.  The
+                # displayed value is only a callback-level residual; it is
+                # not a physical CEC line idle-time measurement.
+                estimated_gap_ms = round(callback_interval_ms - theoretical_duration_ms, 1)
         record = {
             "seq": len(self.capture_records) + 1,
             "time": self._format_capture_time(raw_timestamp_ms),
             "timestamp_ms": raw_timestamp_ms,
             "direction": direction,
             "frame": self._format_frame(frame),
+            "frame_bytes": len(frame),
+            "theoretical_duration_ms": theoretical_duration_ms,
+            "callback_interval_ms": callback_interval_ms,
+            "estimated_gap_ms": estimated_gap_ms,
             "source": f"{source:X}",
             "destination": f"{destination:X}",
             "opcode": opcode,
@@ -2582,7 +2789,8 @@ class CECClientGUI(tk.Tk):
                 str(record.get(key, ""))
                 for key in (
                     "frame", "source", "destination", "opcode_text", "opcode_explanation",
-                    "params", "params_explanation", "status",
+                    "frame_bytes", "theoretical_duration_ms", "callback_interval_ms",
+                    "estimated_gap_ms", "params", "params_explanation", "status",
                 )
             ).lower()
             if needle not in haystack:
@@ -2622,9 +2830,15 @@ class CECClientGUI(tk.Tk):
         highlight_tag = self._capture_highlight_tag(record.get("opcode"))
         if highlight_tag:
             tags.append(highlight_tag)
+        direction = str(record.get("direction", "")).strip().upper()
+        if direction in {"TX", "RX"}:
+            tags.append(f"capture_direction_{direction}")
         values = (
-            record["seq"], record["time"], record["direction"], record["source"],
-            record["destination"], record["frame"], record["opcode_text"],
+            record["seq"], record["time"], record["source"], record["destination"], record["frame"],
+            self._capture_duration_text(record.get("theoretical_duration_ms")),
+            self._capture_duration_text(record.get("callback_interval_ms")),
+            self._capture_duration_text(record.get("estimated_gap_ms")),
+            record["opcode_text"],
             record["opcode_explanation"], record["params"], record["params_explanation"],
             record["status"],
         )
@@ -2655,10 +2869,10 @@ class CECClientGUI(tk.Tk):
         while len(children) > self.capture_display_limit:
             selected = set(self.capture_tree.selection())
             oldest = next((item for item in children if item not in selected), children[0])
-            old_values = self.capture_tree.item(oldest, "values")
-            if len(old_values) > 2 and old_values[2] == "TX":
+            old_tags = self.capture_tree.item(oldest, "tags")
+            if "capture_direction_TX" in old_tags:
                 self.capture_visible_tx_count -= 1
-            elif len(old_values) > 2 and old_values[2] == "RX":
+            elif "capture_direction_RX" in old_tags:
                 self.capture_visible_rx_count -= 1
             self.capture_tree.delete(oldest)
             children = self.capture_tree.get_children()
@@ -2924,6 +3138,7 @@ class CECClientGUI(tk.Tk):
             return
         fields = [
             "seq", "time", "timestamp_ms", "direction", "frame", "source", "destination",
+            "frame_bytes", "theoretical_duration_ms", "callback_interval_ms", "estimated_gap_ms",
             "opcode_text", "opcode_explanation", "params", "params_explanation", "status",
         ]
         try:
@@ -3443,21 +3658,20 @@ class CECClientGUI(tk.Tk):
         def named(value: int, names: dict[int, str], field: str) -> str:
             return f"{field}={names.get(value, '未知')}（0x{value:02X}）"
 
+        def user_control_code_name(value: int) -> str:
+            name = USER_CONTROL_CODE_NAMES.get(value)
+            if name is not None:
+                return name
+            if value in USER_CONTROL_CODE_RESERVED:
+                return "保留（Reserved）"
+            return "未分配/未知"
+
         abort_reasons = {
             0x00: "不认识的 Opcode",
             0x01: "当前模式不能响应",
             0x02: "无法提供请求的源",
             0x03: "操作数无效",
             0x04: "拒绝请求",
-        }
-        key_names = {
-            0x00: "Select", 0x01: "上", 0x02: "下", 0x03: "左", 0x04: "右",
-            0x09: "Home", 0x0D: "返回", 0x20: "数字 0", 0x21: "数字 1",
-            0x22: "数字 2", 0x23: "数字 3", 0x24: "数字 4", 0x25: "数字 5",
-            0x26: "数字 6", 0x27: "数字 7", 0x28: "数字 8", 0x29: "数字 9",
-            0x41: "音量加", 0x42: "音量减", 0x43: "静音", 0x44: "播放",
-            0x45: "停止", 0x46: "暂停", 0x48: "录制", 0x6B: "电源",
-            0x71: "频道加", 0x72: "频道减",
         }
         power_names = {
             0x00: "On", 0x01: "Standby", 0x02: "Transition → On",
@@ -3490,7 +3704,8 @@ class CECClientGUI(tk.Tk):
             suffix = f"；尾随参数={CECClientGUI._colon_bytes(params[3:])}" if len(params) > 3 else ""
             return f"菜单语言={language}（ASCII {CECClientGUI._colon_bytes(params[:3])}）{suffix}"
         if opcode == 0x44:
-            return named(params[0], key_names, "按键") + (f"；尾随参数={CECClientGUI._colon_bytes(params[1:])}" if len(params) > 1 else "")
+            key_name = user_control_code_name(params[0])
+            return f"按键={key_name}（0x{params[0]:02X}）" + (f"；尾随参数={CECClientGUI._colon_bytes(params[1:])}" if len(params) > 1 else "")
         if opcode == 0x47:
             return text(params[:14]) + (f"；尾随参数={CECClientGUI._colon_bytes(params[14:])}" if len(params) > 14 else "")
         if opcode == 0x64:
