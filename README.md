@@ -111,6 +111,79 @@ Parameters:     10:00
 
 点击“应用 LA”调用 `libcec_set_logical_address(0)`；点击“发送 tx”调用 `libcec_transmit`。`txn` 使用零等待传输超时。完整报文的第一个字节必须由 Source/Destination LA 组成：`(Source << 4) | Destination`。
 
+## 逻辑地址占用/碰撞实验
+
+“设备模拟与 Raw → 逻辑地址占用/碰撞”使用自编译 libCEC 的原生扩展，
+直接设置 Pulse-Eight USB 适配器的硬件 ACK Mask，不经过 LA 分配轮询。
+一个适配器可以同时占用多个 LA，例如 Audio System 的 `5`、Playback 的
+`4/8/B`、Recorder 的 `1/2/9` 或 Tuner 的 `3/6/7/A`。`F` 不允许占用。
+仅 ACK 占用不自动发送 Report Physical Address 或其他角色回复。
+
+1. 勾选候选地址。可勾选“连接时启用地址占用”再使用顶部“连接设备”，
+   或在已有连接中点击“开始占用 / 更新占用”。工具会停止 GUI 角色回复，
+   切换至监听路由后设置硬件 ACK。DUT 须已开启 CEC、取得有效物理地址，
+   并处于该 case 要求的 HDMI 拓扑中。
+2. 重启 DUT，或人工/夹具触发其重新分配地址。观察自 Poll（例如 `55`）
+   的 ACK、备用地址轮询、`Report Physical Address` 及 DUT 的实际状态。
+3. 点击“释放全部”，重新触发 DUT 分配，观察 NACK/取得地址和恢复行为。
+4. 需要同 LA 的重复宣告时，可在 Raw 页面注入 `5F:84:20:00:05`。
+   占用期间 Raw 自动应用 LA 会跳过，发送 Header 中的 Source 保持不变。
+   仅 Header 的 Raw 帧（例如 `55`）表示 Poll。
+5. 用“导出实验 JSON”保存操作/观测记录和 Poll ACK/NACK 计数；完整报文仍在
+   “CEC 报文监视”中，使用其 CSV/JSON 导出。实验页保留最近 500 条记录。
+
+底部始终显示占用状态。占用期间不能关闭监听路由或注册普通角色；
+“读取占用状态”返回适配器最后接受的配置，不等于线上的 ACK 测量。
+实际 ACK/NACK 来自 `rawFrame` 的 `cec_command`，不解析文本日志。
+释放后继续被动监听；正常断开会清除测试 Mask，下次启动默认不自动占用。
+旧 DLL 或其他适配器会显示不支持，不会假报占用成功。
+
+本模式可制造“候选地址已被占用”和“已运行 DUT 遭遇重复 LA”条件。
+通过/失败应按 DUT 的 CEC 版本、角色、CDF 和具体 case 判定；单凭无响应不能
+判定通过。HPD/重启仍需设备端或夹具触发，硬件 ACK 不提供位级仲裁/同时发送控制。
+同 LA 的设备在总线 Header 中无法区分，需结合实验步骤及 DUT 日志归因。
+
+原生扩展（仅本项目分支）为 `libcec_set_test_ack_mask(connection, uint16_t mask)`
+和 `libcec_get_test_ack_mask(connection)`；Mask 为 0 时释放。接口要求全部客户端
+处于 monitor-only 状态，并对适配器支持、广播位和 USB 命令返回结果进行检查。
+编译后需重新启动 GUI 加载新 DLL；测试可运行
+`python -m unittest discover -s tests -v`。
+
+当前 x64 DLL 可通过 `powershell -File build-libcec-custom.ps1` 重建。脚本使用
+工程 `work/build-tools` 内的便携 CMake 3.31.6、Ninja 1.11.1.4 和 LLVM-MinGW
+20261006 UCRT x64；先构建到独立目录，通过原生 Mask 和线程回归检查后，安装到
+`libcec-custom-install/bin/cec-occupancy-<hash>.dll`。
+GUI 启动时优先加载最新构建，旧 DLL 保留用于回退；已运行的 GUI 需重启。
+这些工具是本机构建依赖，不会提交入库。CMake/Ninja 可用
+`python -m pip install --target work/build-tools cmake==3.31.6 ninja==1.11.1.4` 获取，
+LLVM-MinGW 使用[官方发布包](https://github.com/mstorsjo/llvm-mingw/releases/tag/20261006)，
+解压到同一 `work/build-tools` 目录。
+
+所绑定的 libCEC 子模块包含异步线程重复启动死锁修复：在启动线程前预留运行状态，
+避免 Sony 连续厂商命令触发持锁等待。原生线程回归覆盖重复/并发启动、停止、自然结束后
+重启及立即销毁；构建脚本在回归失败或超时后不会安装新 DLL。旧版本 DLL 保留用于回退。
+
+## 持续抓包与界面刷新
+
+报文表格默认采用紧凑列宽，窗口缩小时适当压缩长文本列；低于最小可读宽度时仍可横向滚动。
+可拖动表头分隔线调整列宽，双击分隔线按当前内容调整，“重置列宽”恢复默认。
+长报文、Opcode、参数及解释按列宽换行，原始值和导出内容保持不变；“说明”可展开 ACK/时长规则。
+
+“CEC 报文监视”仍从原生 `rawFrame` 回调接收结构化报文，不解析或去重文本日志。
+列表最多展示 2000 行，满表后淘汰旧行（保留选中行），内存记录与 CSV/JSON 导出
+不受这项显示上限影响。表格只绘制可见区域，保留参数换行、Source 底色及 Opcode
+单元格四色高亮，避免满表后移动数万个绘图对象。
+
+事件轮询按批次/时间预算处理；单条事件或地址占用实验界面异常不会中断后续轮询。
+“暂停刷新”只暂停展示，取消后立即补齐列表；浏览历史时不跳到底部，滚到底部后
+继续跟随新报文。下方状态显示累计帧数、待处理事件数、距最近处理帧的时间，以及
+“跟随最新 / 浏览历史 / 显示已暂停”，便于区分界面停留与实际无新数据。
+
+界面异常通过后台写入工具目录下 `outputs/cec-gui-errors.log`，包含时间与异常堆栈。
+该日志用于定位刷新异常，不能作为 CEC 总线流量来源。回归检查：
+`python -m unittest discover -s tests -v`，包含原生回调入口的持续收包、满表淘汰、
+地址占用 Poll 统计、选中保持、暂停恢复及界面异常注入；测试不向总线发送报文。
+
 ## CTS 测试执行器
 
 > 注意：内置目录是项目级测试自动化数据，不是 HDMI Forum 发布的

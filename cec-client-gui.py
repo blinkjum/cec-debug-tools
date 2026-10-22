@@ -16,6 +16,8 @@ import re
 import threading
 import time
 import csv
+import bisect
+import traceback
 from datetime import datetime
 from pathlib import Path
 from tkinter import END, BOTH, LEFT, RIGHT, TOP, X, Y, W, E, N, S
@@ -29,7 +31,8 @@ from cts_testcases import CASE_BY_ID, CASES, AUTO, CONDITIONAL, EXTERNAL, MANUAL
 
 
 APP_NAME = "CEC Client GUI"
-BUILT_CEC = Path(__file__).resolve().with_name("libcec-custom-install") / "bin" / "cec.dll"
+BUILT_CEC = next((path for path in LibCecBackend.bundled_dlls() if path.is_file()),
+                 Path(__file__).resolve().with_name("libcec-custom-install") / "bin" / "cec.dll")
 DEFAULT_CEC = BUILT_CEC if BUILT_CEC.is_file() else Path(r"C:\Program Files\Pulse-Eight\USB-CEC Adapter\cec.dll")
 
 
@@ -397,14 +400,22 @@ class CaptureTable(ttk.Frame):
         self._items: dict[str, dict[str, object]] = {}
         self._row_heights: dict[str, int] = {}
         self._order: list[str] = []
+        self._row_offsets: list[int] = [0]
+        self._render_job: str | None = None
+        self._layout_job: str | None = None
+        self._preferred_widths: dict[str, int] = {}
+        self._minimum_widths: dict[str, int] = {}
+        self._column_drag: tuple[str, float, int] | None = None
+        self._wrap_cache: dict[tuple[str, int], str] = {}
         self._tags: dict[str, dict[str, object]] = {}
         self._selection: tuple[str, ...] = ()
         self._focus_item: str | None = None
         self._next_item = 1
         self._batch_depth = 0
-        self._header_height = 28
-        self._base_row_height = 27
-        self._wrap_columns = {"opcode_explanation", "params_explanation"}
+        self._header_height = 26
+        self._base_row_height = 24
+        self._wrap_columns = {"frame", "theoretical_duration_ms", "callback_interval_ms", "estimated_gap_ms",
+                              "opcode", "opcode_explanation", "params", "params_explanation", "status"}
         self._font = tkfont.nametofont("TkDefaultFont")
         self._header_font = self._font.copy()
         self._header_font.configure(weight="bold")
@@ -417,26 +428,37 @@ class CaptureTable(ttk.Frame):
         self.body_canvas = tk.Canvas(self, highlightthickness=0, background="white")
         self.header_canvas.grid(row=0, column=0, sticky="ew")
         self.body_canvas.grid(row=1, column=0, sticky="nsew")
+        self.body_canvas.configure(yscrollcommand=self._on_yscroll)
         self.body_canvas.bind("<Button-1>", self._on_left_click)
         self.body_canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.body_canvas.bind("<Shift-MouseWheel>", self._on_shift_mousewheel)
         self.body_canvas.bind("<Button-4>", lambda _event: self._scroll_rows(-1))
         self.body_canvas.bind("<Button-5>", lambda _event: self._scroll_rows(1))
         self.header_canvas.bind("<Shift-MouseWheel>", self._on_shift_mousewheel)
-        self.body_canvas.bind("<Configure>", lambda _event: self._redraw())
+        self.header_canvas.bind("<Motion>", self._on_header_motion)
+        self.header_canvas.bind("<ButtonPress-1>", self._on_header_press)
+        self.header_canvas.bind("<B1-Motion>", self._on_header_drag)
+        self.header_canvas.bind("<ButtonRelease-1>", self._on_header_release)
+        self.header_canvas.bind("<Double-1>", self._on_header_autofit)
+        self.body_canvas.bind("<Configure>", self._on_body_configure)
 
     def configure(self, cnf=None, **kwargs):  # type: ignore[no-untyped-def]
         yscrollcommand = kwargs.pop("yscrollcommand", None)
         xscrollcommand = kwargs.pop("xscrollcommand", None)
         if yscrollcommand is not None:
             self._yscrollcommand = yscrollcommand
-            self.body_canvas.configure(yscrollcommand=yscrollcommand)
+            self.body_canvas.configure(yscrollcommand=self._on_yscroll)
         if xscrollcommand is not None:
             self._xscrollcommand = xscrollcommand
             self.body_canvas.configure( xscrollcommand=self._on_xscroll )
         return super().configure(cnf, **kwargs)
 
     config = configure
+
+    def _on_yscroll(self, first: str, last: str) -> None:
+        if self._yscrollcommand is not None:
+            self._yscrollcommand(first, last)
+        self._request_render()
 
     def _on_xscroll(self, first: str, last: str) -> None:
         self.header_canvas.xview_moveto(first)
@@ -450,14 +472,130 @@ class CaptureTable(ttk.Frame):
         return result
 
     def yview(self, *args: object) -> tuple[float, float] | None:
-        return self.body_canvas.yview(*args)
+        result = self.body_canvas.yview(*args)
+        if args:
+            self._request_render()
+        return result
 
     def is_at_bottom(self) -> bool:
         _first, last = self.body_canvas.yview()
         return last >= 0.999
 
+    def set_column_layout(self, preferred: dict[str, int], minimum: dict[str, int]) -> None:
+        """Fit only on window resize/user request, never on incoming traffic."""
+        self._minimum_widths = {
+            column: max(minimum[column], self._header_font.measure(self._headings[column]) + 12)
+            for column in self.columns
+        }
+        self._preferred_widths = {
+            column: max(preferred[column], self._minimum_widths[column]) for column in self.columns
+        }
+        self._apply_column_widths(self._preferred_widths)
+        self.fit_columns()
+
+    def _on_body_configure(self, _event=None) -> None:
+        self._request_render()
+        if self._preferred_widths:
+            if self._layout_job is not None:
+                self.after_cancel(self._layout_job)
+            self._layout_job = self.after(120, self.fit_columns)
+
+    def fit_columns(self, available: int | None = None) -> None:
+        if self._layout_job is not None:
+            self.after_cancel(self._layout_job)
+            self._layout_job = None
+        if not self._preferred_widths:
+            return
+        if available is None:
+            available = self.body_canvas.winfo_width()
+        if available <= 1:
+            return
+        preferred = self._preferred_widths
+        minimum = self._minimum_widths
+        budget = max(sum(minimum.values()), min(available, sum(preferred.values())))
+        extra = budget - sum(minimum.values())
+        flexibility = sum(preferred[c] - minimum[c] for c in self.columns)
+        widths = {c: minimum[c] + (extra * (preferred[c] - minimum[c]) // flexibility if flexibility else 0)
+                  for c in self.columns}
+        remaining = budget - sum(widths.values())
+        for column in self.columns:
+            if remaining and widths[column] < preferred[column]:
+                widths[column] += 1
+                remaining -= 1
+        self._apply_column_widths(widths)
+
+    def _apply_column_widths(self, widths: dict[str, int]) -> None:
+        if all(self._widths[c] == widths[c] for c in self.columns):
+            return
+        follow_tail = self.is_at_bottom()
+        top = max(0.0, self.body_canvas.canvasy(0))
+        anchor = min(len(self._order) - 1, bisect.bisect_right(self._row_offsets, top) - 1)
+        within_row = top - self._row_offsets[anchor] if anchor >= 0 else 0
+        remeasure = any(self._widths[c] != widths[c] for c in self._wrap_columns if c in widths)
+        self._widths.update(widths)
+        if remeasure:
+            for item_id in self._order:
+                self._row_heights[item_id] = self._measure_row_height(item_id)
+        self._redraw()
+        if follow_tail:
+            self.see_end()
+        elif anchor >= 0:
+            position = self._row_offsets[anchor] + min(within_row, self._row_heights[self._order[anchor]] - 1)
+            self.yview("moveto", position / max(1, self._row_offsets[-1]))
+        if sum(self._widths.values()) <= self.body_canvas.winfo_width():
+            self.xview("moveto", 0)
+
+    def _header_edge(self, x: int) -> str | None:
+        position = self.header_canvas.canvasx(x)
+        offset = 0
+        for column in self.columns:
+            offset += self._widths[column]
+            if abs(position - offset) <= 5:
+                return column
+        return None
+
+    def _on_header_motion(self, event: tk.Event) -> None:
+        self.header_canvas.configure(cursor="sb_h_double_arrow" if self._header_edge(event.x) else "")
+
+    def _on_header_press(self, event: tk.Event) -> None:
+        column = self._header_edge(event.x)
+        self._column_drag = ((column, self.header_canvas.canvasx(event.x), self._widths[column])
+                             if column else None)
+
+    def _on_header_drag(self, event: tk.Event) -> None:
+        if self._column_drag:
+            self.header_canvas.delete("resize_guide")
+            x = self.header_canvas.canvasx(event.x)
+            self.header_canvas.create_line(x, 0, x, self._header_height, fill="#1976D2", width=2,
+                                           tags=("resize_guide",))
+
+    def _on_header_release(self, event: tk.Event) -> None:
+        self.header_canvas.delete("resize_guide")
+        drag, self._column_drag = self._column_drag, None
+        if drag:
+            column, start, original = drag
+            widths = dict(self._widths)
+            widths[column] = max(self._minimum_widths.get(column, 40),
+                                 int(original + self.header_canvas.canvasx(event.x) - start))
+            self._preferred_widths = dict(widths)
+            self._apply_column_widths(widths)
+
+    def _on_header_autofit(self, event: tk.Event) -> None:
+        column = self._header_edge(event.x)
+        self._column_drag = None
+        if not column:
+            return
+        index = self.columns.index(column)
+        width = max((self._font.measure(str(self._items[item]["values"][index])) + 12
+                     for item in self._order), default=40)
+        widths = dict(self._widths)
+        widths[column] = max(self._minimum_widths.get(column, 40), min(480, width))
+        self._preferred_widths = dict(widths)
+        self._apply_column_widths(widths)
+
     def see_end(self) -> None:
         self.body_canvas.yview_moveto(1.0)
+        self._request_render()
 
     def heading(self, column: str, option: str | None = None, **kwargs: object):  # type: ignore[no-untyped-def]
         if "text" in kwargs:
@@ -470,6 +608,9 @@ class CaptureTable(ttk.Frame):
     def column(self, column: str, option: str | None = None, **kwargs: object):  # type: ignore[no-untyped-def]
         if "width" in kwargs:
             self._widths[column] = max(30, int(kwargs["width"]))
+            if column in self._wrap_columns:
+                for item_id in self._order:
+                    self._row_heights[item_id] = self._measure_row_height(item_id)
             self._redraw()
         if option == "width":
             return self._widths.get(column, 100)
@@ -485,37 +626,27 @@ class CaptureTable(ttk.Frame):
         self._items[item_id] = {"values": tuple(values), "tags": tuple(tags)}
         self._row_heights[item_id] = self._measure_row_height(item_id)
         self._order.append(item_id)
+        self._row_offsets.append(self._row_offsets[-1] + self._row_heights[item_id])
         if self._batch_depth == 0:
-            y0 = sum(self._row_heights[value] for value in self._order[:-1])
-            self._draw_body_row(item_id, y0)
             self._update_scrollregion()
+            self._request_render()
         return item_id
 
     def delete(self, *items: str) -> None:
-        existing = [item_id for item_id in items if item_id in self._items]
-        single_index = self._order.index(existing[0]) if len(existing) == 1 else None
-        removed_height = (
-            self._row_heights.get(existing[0], self._base_row_height)
-            if single_index is not None
-            else self._base_row_height
-        )
-        for item_id in items:
-            if item_id in self._items:
-                del self._items[item_id]
-                self._row_heights.pop(item_id, None)
-                self._order.remove(item_id)
+        existing = set(items).intersection(self._items)
+        if not existing:
+            return
+        for item_id in existing:
+            del self._items[item_id]
+            self._row_heights.pop(item_id, None)
+        self._order = [item_id for item_id in self._order if item_id not in existing]
+        self._rebuild_offsets()
         self._selection = tuple(item for item in self._selection if item in self._items)
         if self._focus_item not in self._items:
             self._focus_item = None
         if self._batch_depth == 0:
-            if single_index is not None:
-                removed_item = existing[0]
-                self.body_canvas.delete(f"capture_item_{removed_item}")
-                for item_id in self._order[single_index:]:
-                    self.body_canvas.move(f"capture_item_{item_id}", 0, -removed_height)
-                self._update_scrollregion()
-            elif existing:
-                self._redraw()
+            self._update_scrollregion()
+            self._request_render()
 
     def get_children(self, _item: str = "") -> tuple[str, ...]:
         return tuple(self._order)
@@ -534,7 +665,7 @@ class CaptureTable(ttk.Frame):
     def selection_set(self, item: str | tuple[str, ...]) -> None:
         selected = (item,) if isinstance(item, str) else tuple(item)
         self._selection = tuple(value for value in selected if value in self._items)
-        self._redraw()
+        self._request_render()
 
     def focus(self, item: str | None = None):  # type: ignore[no-untyped-def]
         if item is not None:
@@ -544,12 +675,9 @@ class CaptureTable(ttk.Frame):
 
     def identify_row(self, y: int) -> str:
         position = self.body_canvas.canvasy(y)
-        offset = 0
-        for item_id in self._order:
-            offset += self._row_heights.get(item_id, self._base_row_height)
-            if position < offset:
-                return item_id
-        return ""
+        if position < 0 or position >= self._row_offsets[-1]:
+            return ""
+        return self._order[bisect.bisect_right(self._row_offsets, position) - 1]
 
     def identify_column(self, x: int) -> str:
         position = self.body_canvas.canvasx(x)
@@ -605,10 +733,8 @@ class CaptureTable(ttk.Frame):
             return
         total_width = sum(self._widths[column] for column in self.columns)
         self.header_canvas.delete("all")
-        self.body_canvas.delete("all")
         self.header_canvas.configure(scrollregion=(0, 0, total_width, self._header_height))
-        for item_id in self._order:
-            self._row_heights[item_id] = self._measure_row_height(item_id)
+        self._rebuild_offsets()
         self._update_scrollregion()
 
         offset = 0
@@ -618,17 +744,48 @@ class CaptureTable(ttk.Frame):
             self.header_canvas.create_text(offset + 5, self._header_height / 2, text=self._headings[column], anchor="w", font=self._header_font, fill="#202020")
             offset += width
 
-        offset_y = 0
-        for item_id in self._order:
-            self._draw_body_row(item_id, offset_y)
-            offset_y += self._row_heights.get(item_id, self._base_row_height)
+        self._request_render()
 
         first = self.body_canvas.xview()[0]
         self.header_canvas.xview_moveto(first)
 
+    def _rebuild_offsets(self) -> None:
+        offsets = [0]
+        for item_id in self._order:
+            offsets.append(offsets[-1] + self._row_heights.get(item_id, self._base_row_height))
+        self._row_offsets = offsets
+
+    def _request_render(self) -> None:
+        if self._batch_depth or self._render_job is not None:
+            return
+        self._render_job = self.after_idle(self._render_body)
+
+    def _render_body(self) -> None:
+        self._render_job = None
+        if self._batch_depth:
+            return
+        self.body_canvas.delete("capture_row")
+        top = max(0.0, self.body_canvas.canvasy(0))
+        bottom = top + max(1, self.body_canvas.winfo_height())
+        # Keep a small overscan margin. Stored/history rows never become tens
+        # of thousands of canvas objects, and trimming no longer moves them all.
+        start = max(0, bisect.bisect_right(self._row_offsets, top) - 3)
+        end = min(len(self._order), bisect.bisect_left(self._row_offsets, bottom) + 2)
+        for index in range(start, end):
+            self._draw_body_row(self._order[index], self._row_offsets[index])
+
+    def destroy(self) -> None:
+        if self._layout_job is not None:
+            self.after_cancel(self._layout_job)
+            self._layout_job = None
+        if self._render_job is not None:
+            self.after_cancel(self._render_job)
+            self._render_job = None
+        super().destroy()
+
     def _update_scrollregion(self) -> None:
         total_width = sum(self._widths[column] for column in self.columns)
-        total_height = sum(self._row_heights.get(item_id, self._base_row_height) for item_id in self._order)
+        total_height = self._row_offsets[-1]
         self.body_canvas.configure(scrollregion=(0, 0, total_width, total_height))
 
     def _wrap_text(self, value: object, width: int) -> str:
@@ -636,6 +793,9 @@ class CaptureTable(ttk.Frame):
         text = str(value)
         if not text or width <= 1:
             return text
+        key = (text, width)
+        if key in self._wrap_cache:
+            return self._wrap_cache[key]
         lines: list[str] = []
         paragraphs = text.splitlines() or [""]
         for paragraph in paragraphs:
@@ -648,7 +808,11 @@ class CaptureTable(ttk.Frame):
                 else:
                     current = candidate
             lines.append(current)
-        return "\n".join(lines)
+        wrapped = "\n".join(lines)
+        if len(self._wrap_cache) >= 4096:
+            self._wrap_cache.pop(next(iter(self._wrap_cache)))
+        self._wrap_cache[key] = wrapped
+        return wrapped
 
     def _measure_row_height(self, item_id: str) -> int:
         data = self._items.get(item_id, {})
@@ -806,6 +970,13 @@ class AsyncLogWriter:
 class CECClientGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        self._closing = False
+        self._poll_after_id: str | None = None
+        self.gui_error_count = 0
+        self.gui_error_path = Path(__file__).resolve().parent / "outputs" / "cec-gui-errors.log"
+        self.capture_last_frame_at: float | None = None
+        self._capture_display_dirty = False
+        self._capture_display_retry_at = 0.0
         self.title(APP_NAME)
         self.geometry("1280x820")
         self.minsize(980, 650)
@@ -821,6 +992,9 @@ class CECClientGUI(tk.Tk):
         self.connection_role_source: int | None = None
         self.simulation_active = False
         self.simulation_frame_count = 0
+        self.occupancy_busy = False
+        self.occupancy_observed_mask = 0
+        self.occupancy_poll_counts: dict[int, list[int]] = {}
         self.history: list[str] = []
         self.settings_path = self._settings_path()
         self.settings = self._load_settings()
@@ -833,7 +1007,7 @@ class CECClientGUI(tk.Tk):
         self._create_widgets()
         self._load_settings_into_widgets()
         self._bind_events()
-        self.after(80, self._poll_output)
+        self._poll_after_id = self.after(80, self._poll_output)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     @staticmethod
@@ -867,6 +1041,7 @@ class CECClientGUI(tk.Tk):
             "short_log_file": self.short_log_file_var.get(),
             "sim_role": self.sim_role_var.get(),
             "sim_connect": self.sim_connect_var.get(),
+            "occupancy_addresses": [la for la, var in enumerate(self.occupancy_la_vars) if var.get()],
             "sim_source": self.sim_source_var.get(),
             "sim_physical": self.sim_physical_var.get(),
             "sim_osd": self.sim_osd_var.get(),
@@ -921,6 +1096,10 @@ class CECClientGUI(tk.Tk):
         self.device_filter_var = tk.StringVar()
         self.sim_role_var = tk.StringVar(value="x")
         self.sim_connect_var = tk.BooleanVar(value=False)
+        self.occupancy_connect_var = tk.BooleanVar(value=False)
+        self.occupancy_la_vars = [tk.BooleanVar(value=(la == 5)) for la in range(15)]
+        self.occupancy_state_var = tk.StringVar(value="地址占用：未启用")
+        self.occupancy_poll_var = tk.StringVar(value="尚无观测记录")
         self.sim_source_var = tk.StringVar(value="0")
         self.sim_physical_var = tk.StringVar(value="1000")
         self.sim_osd_var = tk.StringVar(value="TestTV")
@@ -955,6 +1134,7 @@ class CECClientGUI(tk.Tk):
         self.capture_direction_var = tk.StringVar(value="ALL")
         self.capture_filter_var = tk.StringVar()
         self.capture_summary_var = tk.StringVar(value="当前显示 0 条：TX 0 / RX 0")
+        self.capture_refresh_state_var = tk.StringVar(value="等待原生报文回调")
         self.capture_visible_tx_count = 0
         self.capture_visible_rx_count = 0
         self.capture_display_limit = 2000
@@ -1040,6 +1220,10 @@ class CECClientGUI(tk.Tk):
                 except tk.TclError:
                     pass
         saved_highlights = self.settings.get("capture_highlight_opcodes", [])
+        saved_addresses = self.settings.get("occupancy_addresses")
+        if isinstance(saved_addresses, list):
+            for la, var in enumerate(self.occupancy_la_vars):
+                var.set(la in saved_addresses)
         if isinstance(saved_highlights, list):
             for highlight_var, value in zip(self.capture_highlight_vars, saved_highlights):
                 if isinstance(value, str):
@@ -1135,6 +1319,8 @@ class CECClientGUI(tk.Tk):
         raw_page = ttk.Frame(self.device_notebook, padding=6)
         self.device_notebook.add(simulation_page, text="角色模拟")
         self.device_notebook.add(raw_page, text="Raw CEC 注入")
+        occupancy_page = ttk.Frame(self.device_notebook, padding=6)
+        self.device_notebook.add(occupancy_page, text="逻辑地址占用/碰撞")
 
         self.test_notebook = ttk.Notebook(cts_tab)
         self.test_notebook.pack(fill=BOTH, expand=True)
@@ -1157,6 +1343,7 @@ class CECClientGUI(tk.Tk):
         self._create_topology_tab(topology_page)
         self._create_simulation_tab(simulation_page)
         self._create_raw_tab(raw_page)
+        self._create_occupancy_tab(occupancy_page)
         self._create_capture_tab(capture_tab)
         self._create_command_tab(command_page)
         self._create_script_tab(script_page)
@@ -1164,6 +1351,7 @@ class CECClientGUI(tk.Tk):
         status = ttk.Frame(outer)
         status.pack(fill=X, pady=(6, 0))
         ttk.Label(status, textvariable=self.status_var).pack(side=LEFT)
+        ttk.Label(status, textvariable=self.occupancy_state_var, foreground="#9A4D00").pack(side=LEFT, padx=12)
         ttk.Label(status, text="  后端：Pulse-Eight libCEC C API").pack(side=RIGHT)
 
     def _create_menu(self) -> None:
@@ -1388,7 +1576,8 @@ class CECClientGUI(tk.Tk):
 
         controls = ttk.Frame(parent)
         controls.grid(row=2, column=0, sticky="ew", pady=(7, 5))
-        ttk.Checkbutton(controls, text="连接时启用角色模拟", variable=self.sim_connect_var).pack(side=LEFT, padx=(0, 10))
+        ttk.Checkbutton(controls, text="连接时启用角色模拟", variable=self.sim_connect_var,
+                        command=lambda: self.occupancy_connect_var.set(False) if self.sim_connect_var.get() else None).pack(side=LEFT, padx=(0, 10))
         self.sim_start_button = ttk.Button(controls, text="应用角色配置", command=self._start_simulation)
         self.sim_start_button.pack(side=LEFT, padx=(0, 5))
         ttk.Button(controls, text="停止模拟", command=self._stop_simulation).pack(side=LEFT, padx=5)
@@ -1416,6 +1605,167 @@ class CECClientGUI(tk.Tk):
         self.sim_rule_text = tk.Text(rules_frame, height=5, wrap="none", font=("Consolas", 9))
         self.sim_rule_text.grid(row=0, column=0, sticky="ew")
         self.sim_rule_text.insert("1.0", "# 入站 opcode|目标(origin/broadcast/十六进制)|响应字节（不含 header）\n# 8F|origin|90:{power}\n# 46|origin|47:{osd}\n# A0|origin|00:01\n")
+
+    def _create_occupancy_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(4, weight=1)
+        ttk.Label(parent, text="让 USB-CEC 适配器在总线上实际应答选定 LA 的 Poll/直接报文，以测试 DUT 地址分配失败、重新分配及冲突恢复。",
+                  wraplength=1050).grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        config = ttk.LabelFrame(parent, text="占用地址（多选；F 广播/未注册地址不可占用）", padding=8)
+        config.grid(row=1, column=0, sticky="ew")
+        labels = ["TV", "Recorder 1", "Recorder 2", "Tuner 1", "Playback 1", "Audio System",
+                  "Tuner 2", "Tuner 3", "Playback 2", "Recorder 3", "Tuner 4", "Playback 3",
+                  "Backup 1 (CEC 2.0)", "Backup 2 (CEC 2.0)", "Free Use"]
+        for la, (var, label) in enumerate(zip(self.occupancy_la_vars, labels)):
+            ttk.Checkbutton(config, text=f"{la:X} — {label}", variable=var).grid(
+                row=la // 5, column=la % 5, sticky=W, padx=8, pady=3)
+            config.columnconfigure(la % 5, weight=1)
+        presets = ttk.Frame(config)
+        presets.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(6, 0))
+        for label, addresses in (("Audio 5", [5]), ("Playback 4/8/B", [4, 8, 11]),
+                                 ("Recorder 1/2/9", [1, 2, 9]), ("Tuner 3/6/7/A", [3, 6, 7, 10]),
+                                 ("全选 0-E", list(range(15))), ("清空选择", [])):
+            ttk.Button(presets, text=label, command=lambda values=addresses: self._occupancy_select(values)).pack(side=LEFT, padx=3)
+        controls = ttk.Frame(parent)
+        controls.grid(row=2, column=0, sticky="ew", pady=8)
+        ttk.Checkbutton(controls, text="连接时启用地址占用", variable=self.occupancy_connect_var,
+                        command=lambda: self.sim_connect_var.set(False) if self.occupancy_connect_var.get() else None).pack(side=LEFT, padx=(0, 8))
+        self.occupancy_buttons = []
+        for label, action in (("开始占用 / 更新占用", "apply"), ("释放全部", "release"), ("读取占用状态", "read")):
+            button = ttk.Button(controls, text=label, command=lambda name=action: self._occupancy_action(name))
+            button.pack(side=LEFT, padx=4)
+            self.occupancy_buttons.append(button)
+        ttk.Label(parent, textvariable=self.occupancy_state_var, foreground="#9A4D00").grid(row=3, column=0, sticky=W)
+        observations = ttk.LabelFrame(parent, text="实验记录（原生 rawFrame；全部总线报文见 CEC 报文监视）", padding=6)
+        observations.grid(row=4, column=0, sticky="nsew", pady=6)
+        observations.columnconfigure(0, weight=1)
+        observations.rowconfigure(1, weight=1)
+        ttk.Label(observations, textvariable=self.occupancy_poll_var).grid(row=0, column=0, sticky=W)
+        ttk.Button(observations, text="清空实验记录", command=self._occupancy_clear_records).grid(row=0, column=1, sticky=E)
+        self.occupancy_events = ttk.Treeview(observations, columns=("time", "mask", "frame", "result", "note"), show="headings")
+        for col, title, width in (("time", "时间", 110), ("mask", "占用 Mask", 95), ("frame", "报文/操作", 165),
+                                  ("result", "状态", 100), ("note", "解释", 450)):
+            self.occupancy_events.heading(col, text=title)
+            self.occupancy_events.column(col, width=width, anchor=W, stretch=(col == "note"))
+        self.occupancy_events.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        scrollbar = ttk.Scrollbar(observations, command=self.occupancy_events.yview)
+        scrollbar.grid(row=1, column=2, sticky="ns")
+        self.occupancy_events.configure(yscrollcommand=scrollbar.set)
+        help_text = (
+            "前提：DUT CEC 已启用且具备有效物理地址/测试拓扑。测试流程：先占用候选 LA → 重启 DUT 或触发其 CEC 地址重新分配 → 观察自 Poll（例如 55）得到 ACK、"
+            "备用地址轮询及 DUT 后续行为 → 释放全部 → 再触发分配，比较恢复行为。DUT 重启/HPD 由测试人员或外部夹具触发。\n"
+            "通过条件：DUT 对已占用候选地址按适用规范/CDF 放弃、选择可用地址或进入未注册状态；"
+            "失败条件：仍使用已占用地址、无合法回退、异常重启或无法恢复。仅凭没有报文不能判定通过。\n"
+            "占用期间停止角色回复，保持监听路由；选定地址的硬件 ACK 会开启，所以此时不是纯被动监听。"
+            "Raw 可另外发送同 Source 的宣告，例如 5F:84:20:00:05；相同 LA 的发帧设备仅凭 Header 无法区分。\n"
+            "读取状态显示适配器最后接受的配置，实际 ACK/NACK 以抓到的 Poll 为准。支持多个 LA 的稳定占用，"
+            "不提供位级仲裁/同时发送时序注入。释放或正常断开会清除测试占用；下次启动默认不自动启用。")
+        ttk.Label(parent, text=help_text, wraplength=1050, justify=LEFT, foreground="#555555").grid(row=5, column=0, sticky="ew", pady=5)
+        ttk.Button(parent, text="导出实验 JSON", command=self._occupancy_export).grid(row=6, column=0, sticky=W, pady=4)
+
+    def _occupancy_select(self, addresses: list[int]) -> None:
+        for la, var in enumerate(self.occupancy_la_vars):
+            var.set(la in addresses)
+
+    def _occupancy_selection_mask(self) -> int:
+        return sum(1 << la for la, var in enumerate(self.occupancy_la_vars) if var.get())
+
+    def _occupancy_clear_records(self) -> None:
+        self.occupancy_events.delete(*self.occupancy_events.get_children())
+        self.occupancy_poll_counts.clear()
+        self.occupancy_poll_var.set("尚无观测记录")
+
+    def _occupancy_export(self) -> None:
+        path = filedialog.asksaveasfilename(title="导出逻辑地址占用实验", defaultextension=".json",
+            initialfile=f"la-occupancy-{datetime.now():%Y%m%d-%H%M%S}.json", filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        payload = {
+            "generated_at": datetime.now().isoformat(timespec="milliseconds"),
+            "port": self.backend.open_port or self.port_var.get(),
+            "libcec_dll": str(self.backend.dll_path),
+            "selected_mask": self._occupancy_selection_mask(),
+            "accepted_mask": self.backend.occupancy_mask,
+            "poll_counts": {f"{la:X}": dict(zip(("ack", "nack", "unknown"), counts))
+                            for la, counts in self.occupancy_poll_counts.items()},
+            "records": [dict(zip(("time", "accepted_mask", "frame_or_action", "status", "note"),
+                                 self.occupancy_events.item(item, "values")))
+                        for item in self.occupancy_events.get_children()],
+            "record_limit": 500,
+            "result": "观测记录；DUT 分配失败/恢复及 CDF 适用性需测试人员判定",
+        }
+        try:
+            Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self.status_var.set(f"占用实验已导出：{path}")
+
+    def _occupancy_record(self, frame: str, result: str, note: str, timestamp: int | None = None) -> None:
+        item = self.occupancy_events.insert("", END, values=(self._format_capture_time(timestamp),
+            f"0x{self.backend.occupancy_mask:04X}", frame, result, note))
+        children = self.occupancy_events.get_children()
+        if len(children) > 500:
+            self.occupancy_events.delete(children[0])
+        self.occupancy_events.see(item)
+
+    def _occupancy_refresh_state(self) -> None:
+        mask = self.backend.occupancy_mask
+        if mask:
+            addresses = "/".join(f"{la:X}" for la in range(15) if mask & (1 << la))
+            self.occupancy_state_var.set(f"地址占用：LA {addresses}（ACK Mask 0x{mask:04X}）")
+            self.monitor_state_var.set("监听路由：开启；地址占用硬件 ACK：开启")
+            self.monitor_off_button.configure(state="disabled")
+            self.sim_start_button.configure(state="disabled")
+        else:
+            self.occupancy_state_var.set("地址占用：未启用")
+            state = "normal" if self.backend.is_open else "disabled"
+            self.monitor_off_button.configure(state=state)
+            self.sim_start_button.configure(state="normal")
+
+    def _occupancy_action(self, action: str) -> None:
+        if self.occupancy_busy:
+            return
+        if not self.backend.is_open:
+            messagebox.showwarning(APP_NAME, "请先使用顶部‘连接设备’；也可勾选‘连接时启用地址占用’后连接。")
+            return
+        if self.cts_running or self.scenario_running or self.raw_send_busy or self.oneshot_busy:
+            messagebox.showwarning(APP_NAME, "请等待当前测试/发送结束，再改变地址占用。")
+            return
+        mask = self._occupancy_selection_mask() if action == "apply" else 0
+        if action == "apply" and not mask:
+            messagebox.showwarning(APP_NAME, "请至少选择一个 LA；释放地址请点击‘释放全部’。")
+            return
+        self.occupancy_busy = True
+        if action == "apply":
+            self.simulation_active = False
+        for button in self.occupancy_buttons:
+            button.configure(state="disabled")
+        threading.Thread(target=self._occupancy_thread, args=(action, mask), daemon=True).start()
+
+    def _occupancy_thread(self, action: str, mask: int) -> None:
+        try:
+            result = (self.backend.address_occupancy() if action == "read"
+                      else self.backend.set_address_occupancy(mask))
+        except Exception as exc:
+            result = BackendResult(False, str(exc))
+        self.output_queue.put(("occupancy_done", (action, result)))
+
+    def _occupancy_observe(self, frame: list[int], event: dict[str, object], status: str, timestamp: int | None) -> None:
+        if not self.occupancy_observed_mask or event.get("direction") != "RX":
+            return
+        source, destination = frame[0] >> 4, frame[0] & 15
+        if len(frame) == 1 and destination < 15:
+            counts = self.occupancy_poll_counts.setdefault(destination, [0, 0, 0])
+            counts[0 if status.startswith("ACK") else 1 if status.startswith("NACK") else 2] += 1
+            summary = "；".join(f"LA {la:X}: ACK {n[0]} / NACK {n[1]} / 未知 {n[2]}"
+                                for la, n in sorted(self.occupancy_poll_counts.items()))
+            self.occupancy_poll_var.set(summary)
+            note = "自 Poll，可能是地址分配/重新分配" if source == destination else "设备探测 Poll"
+            self._occupancy_record(self._format_frame(frame), status, note, timestamp)
+        elif len(frame) > 1 and frame[1] == 0x84:
+            self._occupancy_record(self._format_frame(frame), status,
+                f"LA {source:X} 宣告 Report Physical Address；同 LA 的 DUT 和测试报文需结合实验流程区分", timestamp)
 
     def _create_raw_tab(self, parent: ttk.Frame) -> None:
         self.raw_tab_widget = parent
@@ -1498,8 +1848,9 @@ class CECClientGUI(tk.Tk):
         parent.rowconfigure(3, weight=1)
         parent.columnconfigure(0, weight=1)
         toolbar = ttk.Frame(parent)
-        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Checkbutton(toolbar, text="暂停刷新", variable=self.capture_paused_var).pack(side=LEFT, padx=(0, 10))
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 3))
+        ttk.Checkbutton(toolbar, text="暂停刷新", variable=self.capture_paused_var,
+                        command=self._capture_pause_changed).pack(side=LEFT, padx=(0, 10))
         ttk.Checkbutton(
             toolbar,
             text="显示 Polling",
@@ -1515,17 +1866,13 @@ class CECClientGUI(tk.Tk):
         ttk.Button(toolbar, text="清空", command=self._clear_capture).pack(side=LEFT, padx=4)
         ttk.Button(toolbar, text="导出 CSV", command=self._export_capture_csv).pack(side=LEFT, padx=4)
         ttk.Button(toolbar, text="导出 JSON", command=self._export_capture_json).pack(side=LEFT, padx=4)
-        ttk.Label(toolbar, textvariable=self.capture_summary_var, foreground="#555555").pack(side=RIGHT, padx=(12, 0))
-        ttk.Label(toolbar, text="Opcode 高亮：1黄 / 2红 / 3蓝 / 4绿；行颜色按 Source LA 区分", foreground="#555555").pack(side=RIGHT, padx=(12, 0))
-        ttk.Label(
-            toolbar,
-            text="ACK 规则：单播 0=ACK/1=NACK；广播 1=ACK/0=NACK",
-            foreground="#555555",
-        ).pack(side=RIGHT, padx=(12, 0))
-        ttk.Label(toolbar, text="RX/TX=libCEC rawFrame 原生回调", foreground="#555555").pack(side=RIGHT)
+        ttk.Button(toolbar, text="重置列宽", command=self._reset_capture_columns).pack(side=LEFT, padx=4)
+        show_help = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text="说明", variable=show_help,
+                        command=lambda: help_frame.grid() if show_help.get() else help_frame.grid_remove()).pack(side=LEFT, padx=4)
 
-        highlight_frame = ttk.LabelFrame(parent, text="Opcode 高亮（命中任意一个关注项时突出显示 Opcode 单元格）", padding=(6, 3))
-        highlight_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        highlight_frame = ttk.LabelFrame(parent, text="Opcode 关注（仅高亮命中的单元格）", padding=(4, 1))
+        highlight_frame.grid(row=1, column=0, sticky="ew", pady=(0, 3))
         for column in (1, 3, 5, 7):
             highlight_frame.columnconfigure(column, weight=1)
         highlight_color_names = ("黄", "红", "蓝", "绿")
@@ -1533,19 +1880,19 @@ class CECClientGUI(tk.Tk):
             column = index * 2
             ttk.Label(
                 highlight_frame,
-                text=f"关注 {index + 1}（{highlight_color_names[index]}）",
-            ).grid(row=0, column=column, sticky=E, padx=(4, 3), pady=2)
+                text=f"{index + 1}（{highlight_color_names[index]}）",
+            ).grid(row=0, column=column, sticky=E, padx=(3, 2), pady=1)
             RawValueCombobox(
                 highlight_frame,
                 raw_variable=highlight_var,
                 options=HIGHLIGHT_OPCODE_OPTIONS,
-                width=28,
+                width=20,
                 display_width_limit=30,
                 state="normal",
-            ).grid(row=0, column=column + 1, sticky="ew", padx=(0, 12 if column < 6 else 4), pady=2)
+            ).grid(row=0, column=column + 1, sticky="ew", padx=(0, 6 if column < 6 else 2), pady=1)
 
         interval_frame = ttk.LabelFrame(parent, text="时间间隔（右键两条消息分别设为时间点 1/2）", padding=(6, 3))
-        interval_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        interval_frame.grid(row=2, column=0, sticky="ew", pady=(0, 3))
         interval_frame.columnconfigure(0, weight=1)
         ttk.Label(
             interval_frame,
@@ -1553,12 +1900,19 @@ class CECClientGUI(tk.Tk):
             foreground="#1F3B53",
             anchor=W,
         ).grid(row=0, column=0, sticky="ew")
-        ttk.Label(
-            interval_frame,
-            text="理论帧时长 = Start 4.5 ms + 每字节 24.0 ms；不含总线空闲、重试和响应等待",
-            foreground="#666666",
-            anchor=W,
-        ).grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        ttk.Label(interval_frame, textvariable=self.capture_summary_var,
+                  foreground="#555555", anchor=E).grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ttk.Label(interval_frame, textvariable=self.capture_refresh_state_var,
+                  foreground="#555555", anchor=W).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(1, 0))
+        help_frame = ttk.Frame(interval_frame)
+        help_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        for note in (
+            "RX/TX 来自 libCEC rawFrame 原生回调；ACK 规则：单播 0=ACK/1=NACK，广播 1=ACK/0=NACK；行底色按 Source LA 区分。",
+            "理论帧时长 = Start 4.5 ms + 每字节 24.0 ms；不含总线空闲、重试和响应等待。",
+            "拖动表头分隔线调整列宽；双击分隔线按当前内容调整；重置列宽恢复紧凑布局。长报文、Opcode 和解释会自动换行。",
+        ):
+            ttk.Label(help_frame, text=note, foreground="#666666", anchor=W, wraplength=920).pack(anchor=W)
+        help_frame.grid_remove()
 
         frame = ttk.Frame(parent)
         frame.grid(row=3, column=0, sticky="nsew")
@@ -1571,23 +1925,16 @@ class CECClientGUI(tk.Tk):
         )
         self.capture_tree = CaptureTable(frame, columns=columns)
         headings = {
-            "seq": "#", "time": "时间", "source": "Source",
-            "destination": "Destination", "frame": "报文",
-            "theoretical_duration_ms": "理论帧时长", "callback_interval_ms": "相邻回调间隔",
-            "estimated_gap_ms": "回调间隔−本帧理论", "opcode": "Opcode",
+            "seq": "#", "time": "时间", "source": "源 LA",
+            "destination": "目标 LA", "frame": "报文",
+            "theoretical_duration_ms": "理论时长", "callback_interval_ms": "回调间隔",
+            "estimated_gap_ms": "间隔−理论", "opcode": "Opcode",
             "opcode_explanation": "Opcode 解释", "params": "参数",
             "params_explanation": "参数解释", "status": "ACK 状态",
         }
-        widths = {
-            "seq": 55, "time": 115, "source": 70,
-            "destination": 90, "frame": 180,
-            "theoretical_duration_ms": 110, "callback_interval_ms": 120,
-            "estimated_gap_ms": 125, "opcode": 190,
-            "opcode_explanation": 340, "params": 180, "params_explanation": 420, "status": 145,
-        }
         for column in columns:
             self.capture_tree.heading(column, text=headings[column])
-            self.capture_tree.column(column, width=widths[column], anchor=W)
+        self._reset_capture_columns()
         self.capture_tree.grid(row=0, column=0, sticky="nsew")
         # Use a soft, deterministic color per source LA.  The source and
         # destination columns remain visible, so the color is only a visual
@@ -1621,6 +1968,19 @@ class CECClientGUI(tk.Tk):
         self.capture_tree.bind("<Double-1>", self._capture_reuse_frame)
         self.capture_tree.bind("<Button-3>", self._capture_context_menu, add="+")
         self.capture_tree.bind("<Control-c>", self._copy_capture_current_row, add="+")
+
+    def _reset_capture_columns(self) -> None:
+        preferred = {
+            "seq": 42, "time": 106, "source": 52, "destination": 58, "frame": 140,
+            "theoretical_duration_ms": 82, "callback_interval_ms": 86, "estimated_gap_ms": 90,
+            "opcode": 170, "opcode_explanation": 215, "params": 100, "params_explanation": 275, "status": 108,
+        }
+        minimum = {
+            "seq": 38, "time": 94, "source": 48, "destination": 54, "frame": 90,
+            "theoretical_duration_ms": 68, "callback_interval_ms": 68, "estimated_gap_ms": 76,
+            "opcode": 120, "opcode_explanation": 110, "params": 65, "params_explanation": 145, "status": 80,
+        }
+        self.capture_tree.set_column_layout(preferred, minimum)
 
     def _create_scenario_tab(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(1, weight=1)
@@ -1956,6 +2316,9 @@ class CECClientGUI(tk.Tk):
             self._cts_show_case(self.cts_result_tree.item(selection[0], "values")[0])
 
     def _cts_run_selected(self) -> None:
+        if self.backend.occupancy_mask or self.occupancy_busy:
+            messagebox.showwarning(APP_NAME, "地址占用实验期间请使用占用页面观察 DUT；运行普通 CTS 项目前先释放占用。")
+            return
         if self.cts_running:
             messagebox.showinfo(APP_NAME, "CTS 测试已经在执行。")
             return
@@ -2347,7 +2710,8 @@ class CECClientGUI(tk.Tk):
             kwargs["auto_wake_avr"] = self.autowake_var.get() == "1" if self.autowake_var.get() in ("0", "1") else None
         if "autonomous_mode" not in kwargs:
             kwargs["autonomous_mode"] = self.automode_var.get() == "1" if self.automode_var.get() in ("0", "1") else None
-        kwargs["get_settings_from_rom"] = bool(self.read_rom_var.get())
+        if "get_settings_from_rom" not in kwargs:
+            kwargs["get_settings_from_rom"] = bool(self.read_rom_var.get())
         return self.backend.open(self.port_var.get().strip(), **kwargs)
 
     def _read_simulation_profile(self) -> dict[str, object] | None:
@@ -2391,7 +2755,13 @@ class CECClientGUI(tk.Tk):
         self.simulation_active = False
         kwargs: dict[str, object]
         profile: dict[str, object] | None = None
-        if self.sim_connect_var.get():
+        if self.occupancy_connect_var.get():
+            if not self._occupancy_selection_mask():
+                messagebox.showerror(APP_NAME, "请在地址占用页面至少选择一个 LA。")
+                return
+            kwargs = {"role": "x", "monitor_only": True, "autonomous_mode": False,
+                      "device_name": "LA Occupancy", "get_settings_from_rom": False}
+        elif self.sim_connect_var.get():
             profile = self._read_simulation_profile()
             if profile is None:
                 return
@@ -2427,7 +2797,16 @@ class CECClientGUI(tk.Tk):
         if not result.ok:
             messagebox.showerror(APP_NAME, f"打开 libCEC 失败：\n{result.text}")
             return
-        if profile is not None:
+        if self.occupancy_connect_var.get():
+            occupied = self.backend.set_address_occupancy(self._occupancy_selection_mask())
+            if not occupied.ok:
+                self.backend.close()
+                messagebox.showerror(APP_NAME, occupied.text)
+                return
+            self.connection_profile = "occupancy"
+            self.connection_role_source = None
+            connection_text = "地址占用实验运行中"
+        elif profile is not None:
             address_result = self.backend.set_logical_address(int(profile["source"]))
             if not address_result.ok:
                 self.backend.close()
@@ -2453,12 +2832,16 @@ class CECClientGUI(tk.Tk):
         self.monitor_off_button.configure(state="normal")
         self.sim_start_button.configure(state="normal")
         self.status_var.set(connection_text)
+        self._occupancy_refresh_state()
 
     def _start_session(self) -> None:
         """Compatibility wrapper for older settings or external callers."""
         self._connect_device()
 
     def _start_simulation(self) -> None:
+        if self.backend.occupancy_mask or self.occupancy_busy:
+            messagebox.showwarning(APP_NAME, "先释放全部地址占用，再应用角色配置。")
+            return
         profile = self._read_simulation_profile()
         if profile is None:
             return
@@ -2494,6 +2877,16 @@ class CECClientGUI(tk.Tk):
 
     def _handle_backend_event(self, event: dict[str, object]) -> None:
         kind = str(event.get("kind", ""))
+        if kind == "occupancy":
+            mask = self.backend.occupancy_mask
+            if mask:
+                self.occupancy_observed_mask = mask
+            self.raw_monitor_var.set(True)
+            self.monitor_state_var.set("监听模式：开启")
+            self.capture_show_poll_var.set(True)
+            self._refresh_capture_tree()
+            self._occupancy_refresh_state()
+            return
         if kind == "log":
             level = event.get("level", 0)
             text = str(event.get("text", ""))
@@ -2529,6 +2922,11 @@ class CECClientGUI(tk.Tk):
             except (TypeError, ValueError):
                 raw_timestamp_ms = None
             self._capture_backend_frame(direction, frame, status, raw_timestamp_ms)
+            # Experiment widgets must never stop the common native capture pump.
+            try:
+                self._occupancy_observe(frame, event, status, raw_timestamp_ms)
+            except Exception as exc:
+                self._report_ui_error("地址占用实验观测", exc)
             frame_line = f"{direction} {self._format_frame(frame)}" + (f" -> {status}" if direction == "TX" else "") + "\n"
             self._append_event_file(self.short_log_file_var.get(), frame_line)
             self._append_output(frame_line)
@@ -2557,6 +2955,8 @@ class CECClientGUI(tk.Tk):
                 self.monitor_on_button.configure(state="disabled")
                 self.monitor_off_button.configure(state="disabled")
                 self.sim_start_button.configure(state="normal")
+                self.occupancy_observed_mask = 0
+                self._occupancy_refresh_state()
             self.status_var.set(str(event.get("text", "")))
             return
         if kind == "scan":
@@ -2699,17 +3099,89 @@ class CECClientGUI(tk.Tk):
             "status": status,
         }
         self.capture_records.append(record)
+        self.capture_last_frame_at = time.monotonic()
         if direction == "TX":
             self.capture_last_tx = record
-        self._append_capture_record_to_tree(record)
+        try:
+            self._append_capture_record_to_tree(record)
+        except Exception as exc:
+            self._capture_display_dirty = True
+            self._report_ui_error("报文表格增量更新", exc)
         with self.capture_condition:
             self.capture_condition.notify_all()
 
     def _poll_output(self) -> None:
-        for event in self.backend.drain_events():
-            self._handle_backend_event(event)
+        if self._poll_after_id is not None:
+            self.after_cancel(self._poll_after_id)
+            self._poll_after_id = None
+        if self._closing:
+            return
         try:
-            while True:
+            # Leave time for Tk painting, scrolling and input even under a burst.
+            # Drain one event at a time: a bad event cannot discard a pre-drained batch.
+            deadline = time.perf_counter() + 0.015
+            for _ in range(100):
+                events = self.backend.drain_events(limit=1)
+                if not events:
+                    break
+                event = events[0]
+                try:
+                    self._handle_backend_event(event)
+                except Exception as exc:
+                    self._report_ui_error(f"原生事件 {event.get('kind', '?')}", exc)
+                if time.perf_counter() >= deadline:
+                    break
+            self._drain_output_queue()
+            if self._capture_display_dirty and time.monotonic() >= self._capture_display_retry_at:
+                self._capture_display_retry_at = time.monotonic() + 1.0
+                self._refresh_capture_tree()
+            self._update_capture_refresh_state()
+        except Exception as exc:
+            self._report_ui_error("界面消息轮询", exc)
+        finally:
+            # Reschedule even when an auxiliary widget/decoder/output task failed.
+            if not self._closing:
+                busy = self.backend.pending_event_count or not self.output_queue.empty()
+                self._poll_after_id = self.after(10 if busy else 80, self._poll_output)
+
+    def _report_ui_error(self, context: str, error: Exception) -> None:
+        self.gui_error_count += 1
+        details = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        try:
+            self.log_writer.write(self.gui_error_path, f"\n[{datetime.now().isoformat(timespec='milliseconds')}] {context}\n{details}")
+            self.status_var.set(f"界面异常已记录，继续接收：{context}")
+        except (tk.TclError, OSError):
+            pass
+
+    def report_callback_exception(self, exc_type, error, tb) -> None:
+        if hasattr(self, "capture_tree"):
+            self._capture_display_dirty = True
+        self._report_ui_error("Tk 界面回调", error.with_traceback(tb))
+
+    def _capture_pause_changed(self) -> None:
+        if not self.capture_paused_var.get():
+            self._refresh_capture_tree()
+        self._update_capture_refresh_state()
+
+    def _update_capture_refresh_state(self) -> None:
+        if self.capture_paused_var.get():
+            mode = "显示已暂停（仍在记录）"
+        elif self.capture_tree.is_at_bottom():
+            mode = "跟随最新"
+        else:
+            mode = "浏览历史（滚到底部恢复跟随）"
+        recent = ("尚无报文" if self.capture_last_frame_at is None else
+                  f"最近处理帧 {time.monotonic() - self.capture_last_frame_at:.1f}s 前")
+        errors = f"；界面异常 {self.gui_error_count} 次（已记录）" if self.gui_error_count else ""
+        self.capture_refresh_state_var.set(
+            f"{mode}；累计记录 {len(self.capture_records)} 帧；待处理事件 {self.backend.pending_event_count}；{recent}{errors}")
+
+    def _drain_output_queue(self) -> None:
+        deadline = time.perf_counter() + 0.008
+        try:
+            for _ in range(100):
+                if time.perf_counter() >= deadline:
+                    break
                 kind, value = self.output_queue.get_nowait()
                 if kind == "script_command":
                     self._send_command(str(value))
@@ -2719,6 +3191,20 @@ class CECClientGUI(tk.Tk):
                 elif kind == "raw_done":
                     self.raw_send_busy = False
                     self.status_var.set("Raw 报文发送完成")
+                elif kind == "occupancy_done":
+                    action, result = value
+                    self.occupancy_busy = False
+                    for button in self.occupancy_buttons:
+                        button.configure(state="normal")
+                    self._occupancy_refresh_state()
+                    if self.backend.monitor_only:
+                        self.raw_monitor_var.set(True)
+                        if not self.backend.occupancy_mask:
+                            self.monitor_state_var.set("监听模式：开启")
+                    self._occupancy_record(action, "成功" if result.ok else "失败", result.text)
+                    self._append_output(f">>> 地址占用 {action}: {result.text}\n")
+                    if not result.ok:
+                        messagebox.showerror(APP_NAME, result.text)
                 elif kind == "scenario_command":
                     if self.backend.is_open:
                         self._send_command(str(value))
@@ -2775,7 +3261,6 @@ class CECClientGUI(tk.Tk):
                     self.status_var.set("未连接" if not self.backend.is_open else "libCEC 会话运行中")
         except queue.Empty:
             pass
-        self.after(80, self._poll_output)
 
     def _capture_record_matches_filter(self, record: dict) -> bool:
         if record.get("opcode") is None and not self.capture_show_poll_var.get():
@@ -2884,13 +3369,15 @@ class CECClientGUI(tk.Tk):
         if not hasattr(self, "capture_tree") or self.capture_paused_var.get():
             return
         selected_sequence = self._capture_selected_sequence()
+        follow_tail = self.capture_tree.is_at_bottom()
+        previous_view = self.capture_tree.yview()
         self.capture_tree.begin_update()
         try:
             self.capture_tree.delete(*self.capture_tree.get_children())
             self.capture_visible_tx_count = 0
             self.capture_visible_rx_count = 0
             sequence_items: dict[int, str] = {}
-            for record in self.capture_records[-2000:]:
+            for record in self.capture_records[-self.capture_display_limit:]:
                 if not self._capture_record_matches_filter(record):
                     continue
                 if record.get("direction") == "TX":
@@ -2911,6 +3398,11 @@ class CECClientGUI(tk.Tk):
                 self.capture_tree.focus(selected_item)
         finally:
             self.capture_tree.end_update()
+        if follow_tail:
+            self.capture_tree.see_end()
+        else:
+            self.capture_tree.yview("moveto", previous_view[0])
+        self._capture_display_dirty = False
         self._update_capture_summary()
 
     def _capture_selected_sequence(self) -> int | None:
@@ -3105,6 +3597,8 @@ class CECClientGUI(tk.Tk):
 
     def _clear_capture(self) -> None:
         self.capture_records.clear()
+        self.capture_last_frame_at = None
+        self._capture_display_dirty = False
         self.capture_interval_marks.clear()
         self.capture_visible_tx_count = 0
         self.capture_visible_rx_count = 0
@@ -3828,6 +4322,9 @@ class CECClientGUI(tk.Tk):
         self._send_command(f"la {source:X}")
 
     def _set_monitoring(self, enabled: bool) -> None:
+        if self.occupancy_busy or self.backend.occupancy_mask:
+            messagebox.showinfo(APP_NAME, "地址占用期间保留监听路由及硬件 ACK；先释放全部占用再切换监听模式。")
+            return
         if not self.backend.is_open:
             messagebox.showwarning(APP_NAME, "请先在窗口顶部连接设备，再切换监听模式。")
             return
@@ -3918,7 +4415,7 @@ class CECClientGUI(tk.Tk):
             return
         mode = "txn" if no_ack or self.raw_no_ack_var.get() else "tx"
         frame_text = self._format_frame(frame)
-        if self.raw_auto_la_var.get():
+        if self.raw_auto_la_var.get() and not self.backend.occupancy_mask:
             self.raw_source_var.set(f"{source:X}")
             self._send_command(f"la {source:X}")
         self._raw_add_history(mode, frame_text, count)
@@ -3975,7 +4472,8 @@ class CECClientGUI(tk.Tk):
         for mode, frame, _source in batch:
             self._raw_add_history(mode, frame, 1)
         self.status_var.set(f"批量发送中：{len(batch)} 帧")
-        threading.Thread(target=self._raw_batch_thread, args=(batch, interval, self.raw_auto_la_var.get()), daemon=True).start()
+        threading.Thread(target=self._raw_batch_thread,
+            args=(batch, interval, self.raw_auto_la_var.get() and not self.backend.occupancy_mask), daemon=True).start()
 
     def _raw_batch_thread(self, batch: list[tuple[str, str, int]], interval: float, auto_la: bool) -> None:
         last_source: int | None = None
@@ -4017,8 +4515,8 @@ class CECClientGUI(tk.Tk):
 
     def _parse_frame(self, value: str) -> list[int]:
         frame = self._parse_byte_list(value)
-        if len(frame) < 2:
-            raise ValueError("CEC 报文至少需要 header 和 opcode")
+        if not frame:
+            raise ValueError("CEC 报文至少需要 header；仅 header 表示 Poll，例如 55")
         if len(frame) > 16:
             raise ValueError("CEC 单帧最多 16 个字节")
         return frame
@@ -4268,6 +4766,13 @@ class CECClientGUI(tk.Tk):
         self.log_writer.close()
         self._save_settings()
         self.destroy()
+
+    def destroy(self) -> None:
+        self._closing = True
+        if self._poll_after_id is not None:
+            self.after_cancel(self._poll_after_id)
+            self._poll_after_id = None
+        super().destroy()
 
 
 def main() -> None:

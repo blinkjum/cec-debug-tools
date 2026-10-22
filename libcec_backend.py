@@ -296,6 +296,7 @@ class LibCecBackend:
         self._lock = threading.RLock()
         self._open_port = ""
         self._monitor_only = False
+        self._occupancy_mask = 0
         self._role = "x"
         self._logical_address = 4
         self._physical_address = 0x1000
@@ -310,8 +311,23 @@ class LibCecBackend:
         return self._open_port
 
     @property
+    def occupancy_mask(self) -> int:
+        """Last mask accepted by the native adapter API, not a bus measurement."""
+        return self._occupancy_mask if self.is_open else 0
+
+    @property
+    def monitor_only(self) -> bool:
+        return self._monitor_only if self.is_open else False
+
+    @property
     def load_error(self) -> str | None:
         return self._load_error
+
+    @staticmethod
+    def bundled_dlls() -> list[Path]:
+        directory = Path(__file__).resolve().with_name("libcec-custom-install") / "bin"
+        versions = sorted(directory.glob("cec-occupancy-*.dll"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
+        return [*versions, directory / "cec-occupancy.dll", directory / "cec.dll"]
 
     def _candidate_dlls(self) -> list[Path]:
         candidates: list[Path] = []
@@ -323,9 +339,9 @@ class LibCecBackend:
             value = os.environ.get(env_name, "").strip()
             if value:
                 candidates.append(Path(value))
+        candidates.extend(self.bundled_dlls())
         candidates.extend(
             [
-                Path(__file__).resolve().with_name("libcec-custom-install") / "bin" / "cec.dll",
                 Path(r"C:\Program Files\Pulse-Eight\USB-CEC Adapter\cec.dll"),
                 Path(r"C:\Program Files (x86)\Pulse-Eight\USB-CEC Adapter\cec.dll"),
                 Path(__file__).resolve().with_name("cec.dll"),
@@ -383,6 +399,12 @@ class LibCecBackend:
         self._f_inactive_source = bind("libcec_set_inactive_view", ctypes.c_int, [ctypes.c_void_p])
         self._f_transmit = bind("libcec_transmit", ctypes.c_int, [ctypes.c_void_p, ctypes.POINTER(CecCommand)])
         self._f_set_la = bind("libcec_set_logical_address", ctypes.c_int, [ctypes.c_void_p, ctypes.c_int])
+        self._f_test_ack_set = self._f_test_ack_get = None
+        try:
+            self._f_test_ack_set = bind("libcec_set_test_ack_mask", ctypes.c_int, [ctypes.c_void_p, ctypes.c_uint16])
+            self._f_test_ack_get = bind("libcec_get_test_ack_mask", ctypes.c_int, [ctypes.c_void_p])
+        except AttributeError:
+            pass  # Older DLLs still work; occupancy reports the missing extension.
         self._f_set_pa = bind("libcec_set_physical_address", ctypes.c_int, [ctypes.c_void_p, ctypes.c_uint16])
         self._f_set_osd = bind("libcec_set_osd_string", ctypes.c_int, [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p])
         self._f_monitor = bind("libcec_switch_monitoring", ctypes.c_int, [ctypes.c_void_p, ctypes.c_int])
@@ -570,6 +592,11 @@ class LibCecBackend:
                 break
         return result
 
+    @property
+    def pending_event_count(self) -> int:
+        """Approximate queue depth for GUI scheduling, not a bus statistic."""
+        return self._events.qsize()
+
     def open(
         self,
         port: str,
@@ -620,6 +647,7 @@ class LibCecBackend:
                     self._connection = ctypes.c_void_p()
                     return BackendResult(False, f"libcec_open 失败：{port}")
                 self._open_port = str(port)
+                self._occupancy_mask = 0
                 self._monitor_only = bool(monitor_only)
                 self._role = role.lower()
                 if physical_address is not None:
@@ -635,6 +663,11 @@ class LibCecBackend:
             if not self.is_open:
                 return
             connection = self._connection
+            if self._occupancy_mask and self._f_test_ack_set:
+                try:
+                    self._f_test_ack_set(connection, 0)
+                except OSError:
+                    pass  # Native adapter Close also clears its ACK mask.
             self._connection = ctypes.c_void_p()
             try:
                 self._f_disable_callbacks(connection)
@@ -648,6 +681,7 @@ class LibCecBackend:
                 except Exception:
                     pass
             self._open_port = ""
+            self._occupancy_mask = 0
             self._put_event("state", text="libCEC 已关闭", connected=False)
 
     def _require_open(self) -> ctypes.c_void_p:
@@ -658,8 +692,8 @@ class LibCecBackend:
     @staticmethod
     def frame_to_command(frame: Iterable[int], wait_for_ack: bool = True) -> CecCommand:
         values = [int(value) & 0xFF for value in frame]
-        if len(values) < 2:
-            raise ValueError("CEC 报文至少需要 header 和 opcode")
+        if not values:
+            raise ValueError("CEC 报文至少需要 header；仅 header 表示 Poll")
         if len(values) > CEC_MAX_FRAME_SIZE:
             raise ValueError("CEC 单帧最多 16 个字节")
         command = CecCommand()
@@ -667,10 +701,10 @@ class LibCecBackend:
         command.destination = values[0] & 0x0F
         command.ack = 0
         command.eom = 1
-        command.opcode = values[1]
-        command.opcode_set = 1
+        command.opcode = values[1] if len(values) > 1 else 0xFD
+        command.opcode_set = int(len(values) > 1)
         command.transmit_timeout = 1000 if wait_for_ack else 0
-        command.parameters.size = len(values) - 2
+        command.parameters.size = max(0, len(values) - 2)
         for index, value in enumerate(values[2:]):
             command.parameters.data[index] = value
         return command
@@ -712,6 +746,8 @@ class LibCecBackend:
 
     def set_logical_address(self, address: int) -> BackendResult:
         with self._lock:
+            if self.occupancy_mask:
+                return BackendResult(False, "地址占用期间不能申请角色 LA；请先释放全部占用。Raw 发送可直接指定 Source LA。")
             try:
                 result = int(self._f_set_la(self._require_open(), int(address) & 0x0F))
                 if result:
@@ -732,11 +768,53 @@ class LibCecBackend:
 
     def switch_monitoring(self, enabled: bool) -> BackendResult:
         with self._lock:
+            if self.occupancy_mask:
+                return BackendResult(bool(enabled), "地址占用期间保持监听路由和硬件 ACK；关闭被动监听前请先释放全部占用。")
             try:
                 result = int(self._f_monitor(self._require_open(), 1 if enabled else 0))
                 state = "开启" if enabled else "关闭"
                 suffix = "成功" if result else "失败"
-                return BackendResult(bool(result), f"总线监视 {state}{suffix}", result)
+                if result == 1:
+                    self._monitor_only = bool(enabled)
+                return BackendResult(result == 1, f"总线监视 {state}{suffix}", result)
+            except (LibCecError, OSError) as exc:
+                return BackendResult(False, str(exc))
+
+    def address_occupancy(self) -> BackendResult:
+        with self._lock:
+            try:
+                connection = self._require_open()
+                if not self._f_test_ack_get or not self._f_test_ack_set:
+                    return BackendResult(False, "当前 DLL 缺少地址占用 API，请加载工具目录的自编译 cec.dll。")
+                mask = int(self._f_test_ack_get(connection))
+                if mask < 0:
+                    return BackendResult(False, "当前适配器不支持强制 ACK Mask，或连接已失效。仅支持 Pulse-Eight USB-CEC。")
+                self._occupancy_mask = mask
+                return BackendResult(True, f"适配器已接受的占用 ACK Mask = 0x{mask:04X}", mask)
+            except (LibCecError, OSError) as exc:
+                return BackendResult(False, str(exc))
+
+    def set_address_occupancy(self, mask: int) -> BackendResult:
+        """Set hardware ACK occupancy without LA allocation or role replies."""
+        with self._lock:
+            if not isinstance(mask, int) or mask < 0 or mask > 0x7FFF:
+                return BackendResult(False, "占用 Mask 仅允许 LA 0-E；F 是广播/未注册地址，不能占用。")
+            state = self.address_occupancy()
+            if not state.ok:
+                return state
+            if mask and not self._monitor_only:
+                monitor = self.switch_monitoring(True)
+                if not monitor.ok:
+                    return monitor
+            try:
+                result = int(self._f_test_ack_set(self._require_open(), mask))
+                state = self.address_occupancy()
+                if result != 1 or not state.ok or state.value != mask:
+                    return BackendResult(False, "适配器未确认新的占用 Mask；保留最后确认状态。" + state.text, state.value)
+                text = (f"占用 LA = {', '.join(f'{la:X}' for la in range(15) if mask & (1 << la))}；硬件 ACK Mask = 0x{mask:04X}"
+                        if mask else "已释放全部测试地址；会话继续被动监听。")
+                self._put_event("occupancy", mask=mask, text=text)
+                return BackendResult(True, text, mask)
             except (LibCecError, OSError) as exc:
                 return BackendResult(False, str(exc))
 
