@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from runtime_paths import resource_directories
+
 
 CEC_MAX_DATA_PACKET_SIZE = 64
 CEC_MAX_FRAME_SIZE = 16
@@ -325,9 +327,12 @@ class LibCecBackend:
 
     @staticmethod
     def bundled_dlls() -> list[Path]:
-        directory = Path(__file__).resolve().with_name("libcec-custom-install") / "bin"
-        versions = sorted(directory.glob("cec-occupancy-*.dll"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
-        return [*versions, directory / "cec-occupancy.dll", directory / "cec.dll"]
+        candidates: list[Path] = []
+        for root in resource_directories():
+            directory = root / "libcec-custom-install" / "bin"
+            versions = sorted(directory.glob("cec-occupancy-*.dll"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
+            candidates.extend([*versions, directory / "cec-occupancy.dll", directory / "cec.dll", root / "cec.dll"])
+        return candidates
 
     def _candidate_dlls(self) -> list[Path]:
         candidates: list[Path] = []

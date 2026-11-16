@@ -8,6 +8,11 @@ venv/
 *.log
 outputs/
 work/
+dist/
+
+# Local reference application and reverse-engineering helpers
+/cec_checker/
+/tools/*Ghidra*
 
 # Local libCEC/CMake build products
 CMakeCache.txt

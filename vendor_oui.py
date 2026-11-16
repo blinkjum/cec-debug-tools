@@ -5,6 +5,8 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
+from runtime_paths import application_directory, resource_directories
+
 
 class OuiLookup:
     """Load an IEEE MA-L CSV and resolve CEC's three-byte Vendor ID."""
@@ -63,7 +65,7 @@ class OuiLookup:
         return True
 
     def load_default(self, preferred: str | Path | None = None) -> bool:
-        tool_path = Path(__file__).resolve().with_name("oui.csv")
+        tool_path = application_directory() / "oui.csv"
         downloads_path = Path.home() / "Downloads" / "oui.csv"
         candidates: list[Path] = []
         if preferred:
@@ -80,6 +82,7 @@ class OuiLookup:
         candidates.extend(
             (
                 tool_path,
+                *(directory / "oui.csv" for directory in resource_directories()),
                 downloads_path,
             )
         )

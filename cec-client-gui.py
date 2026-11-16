@@ -18,6 +18,8 @@ import time
 import csv
 import bisect
 import traceback
+import sys
+from uuid import uuid4
 from datetime import datetime
 from pathlib import Path
 from tkinter import END, BOTH, LEFT, RIGHT, TOP, X, Y, W, E, N, S
@@ -28,11 +30,14 @@ import tkinter.font as tkfont
 from libcec_backend import BackendResult, LibCecBackend, LibCecError, OPCODE_NAMES
 from vendor_oui import OuiLookup
 from cts_testcases import CASE_BY_ID, CASES, AUTO, CONDITIONAL, EXTERNAL, MANUAL, CtsTestCase
+from runtime_paths import application_directory
+from cec_workbench_ui import CaptureWorkbenchMixin, LA_CHOICES
+from cec_workbench import HIGHLIGHT_PALETTE, HIGHLIGHT_RULE_COUNT
 
 
 APP_NAME = "CEC Client GUI"
 BUILT_CEC = next((path for path in LibCecBackend.bundled_dlls() if path.is_file()),
-                 Path(__file__).resolve().with_name("libcec-custom-install") / "bin" / "cec.dll")
+                 application_directory() / "libcec-custom-install" / "bin" / "cec.dll")
 DEFAULT_CEC = BUILT_CEC if BUILT_CEC.is_file() else Path(r"C:\Program Files\Pulse-Eight\USB-CEC Adapter\cec.dll")
 
 
@@ -144,7 +149,6 @@ OPCODE_GUIDE: dict[int, tuple[str, str, str, str]] = {
 }
 
 OPCODE_CATALOG_OPTIONS = [(f"{opcode:02X}", guide[0]) for opcode, guide in sorted(OPCODE_GUIDE.items())]
-HIGHLIGHT_OPCODE_OPTIONS = [("", "不高亮"), *OPCODE_CATALOG_OPTIONS]
 
 
 # CEC User Control Code values carried as the single operand of
@@ -597,6 +601,17 @@ class CaptureTable(ttk.Frame):
         self.body_canvas.yview_moveto(1.0)
         self._request_render()
 
+    def see(self, item: str) -> None:
+        if item not in self._items:
+            return
+        index = self._order.index(item)
+        top, bottom = self._row_offsets[index:index + 2]
+        view_top = self.body_canvas.canvasy(0)
+        height = max(1, self.body_canvas.winfo_height())
+        if top < view_top or bottom > view_top + height:
+            self.body_canvas.yview_moveto(max(0, top - height // 3) / max(1, self._row_offsets[-1]))
+        self._request_render()
+
     def heading(self, column: str, option: str | None = None, **kwargs: object):  # type: ignore[no-untyped-def]
         if "text" in kwargs:
             self._headings[column] = str(kwargs["text"])
@@ -653,6 +668,13 @@ class CaptureTable(ttk.Frame):
 
     def item(self, item: str, option: str | None = None, **kwargs: object):  # type: ignore[no-untyped-def]
         data = self._items.get(item, {})
+        if kwargs and item in self._items:
+            data.update(kwargs)
+            if "values" in kwargs:
+                self._row_heights[item] = self._measure_row_height(item)
+                self._rebuild_offsets()
+                self._update_scrollregion()
+            self._request_render()
         if option == "values":
             return data.get("values", ())
         if option == "tags":
@@ -664,8 +686,11 @@ class CaptureTable(ttk.Frame):
 
     def selection_set(self, item: str | tuple[str, ...]) -> None:
         selected = (item,) if isinstance(item, str) else tuple(item)
+        previous = self._selection
         self._selection = tuple(value for value in selected if value in self._items)
         self._request_render()
+        if self._selection != previous:
+            self.body_canvas.event_generate("<<TreeviewSelect>>", when="tail")
 
     def focus(self, item: str | None = None):  # type: ignore[no-untyped-def]
         if item is not None:
@@ -891,6 +916,12 @@ class AsyncLogWriter:
         if path and text and not self._closed:
             self._queue.put(("write", (path, text)))
 
+    def replace_json(self, path: Path | str, payload: object) -> None:
+        """Queue an atomic JSON replacement, ordered with all other file writes."""
+        if not self._closed:
+            text = json.dumps(payload, ensure_ascii=False, indent=2)
+            self._queue.put(("replace", (str(path), text)))
+
     def flush(self, *, wait: bool = False, timeout: float = 2.0) -> bool:
         if self._closed:
             return True
@@ -940,6 +971,25 @@ class AsyncLogWriter:
                         if path not in failed_paths:
                             failed_paths.add(path)
                             self._report_error(path, exc)
+                elif command == "replace":
+                    path, text = payload  # type: ignore[misc]
+                    target = Path(path)
+                    temporary = target.with_name(target.name + f".{uuid4().hex}.tmp")
+                    try:
+                        old_handle = handles.pop(path, None)
+                        if old_handle is not None:
+                            old_handle.close()
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        temporary.write_text(text, encoding="utf-8")
+                        os.replace(temporary, target)
+                        failed_paths.discard(path)
+                    except OSError as exc:
+                        self._report_error(path, exc)
+                    finally:
+                        try:
+                            temporary.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                 elif command == "flush":
                     flush_events.append(payload)  # type: ignore[arg-type]
                 elif command == "close":
@@ -967,13 +1017,15 @@ class AsyncLogWriter:
             close_event.set()
 
 
-class CECClientGUI(tk.Tk):
-    def __init__(self) -> None:
+class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
+    def __init__(self, *, read_settings: bool = True, start_hidden: bool = False) -> None:
         super().__init__()
+        if start_hidden:
+            self.withdraw()
         self._closing = False
         self._poll_after_id: str | None = None
         self.gui_error_count = 0
-        self.gui_error_path = Path(__file__).resolve().parent / "outputs" / "cec-gui-errors.log"
+        self.gui_error_path = application_directory() / "outputs" / "cec-gui-errors.log"
         self.capture_last_frame_at: float | None = None
         self._capture_display_dirty = False
         self._capture_display_retry_at = 0.0
@@ -997,10 +1049,11 @@ class CECClientGUI(tk.Tk):
         self.occupancy_poll_counts: dict[int, list[int]] = {}
         self.history: list[str] = []
         self.settings_path = self._settings_path()
-        self.settings = self._load_settings()
+        self.settings = self._load_settings() if read_settings else {}
         self.oui_lookup = OuiLookup()
 
         self._create_variables()
+        self._wb_init(read_settings)
         self.oui_lookup.load_default(self.settings.get("oui_path"))
         self.oui_path_var.set(str(self.oui_lookup.path) if self.oui_lookup.path else "未加载 OUI 厂商表；可从“工具 → 选择 OUI 厂商表”加载")
         self._refresh_vendor_id_help()
@@ -1032,6 +1085,7 @@ class CECClientGUI(tk.Tk):
             "vendor_id": self.vendor_id_var.get(),
             "oui_path": self.oui_path_var.get(),
             "capture_highlight_opcodes": [var.get() for var in self.capture_highlight_vars],
+            "capture_highlight_rules": self._wb_highlight_preferences(),
             "log_level": self.log_level_var.get(),
             "autowake": self.autowake_var.get(),
             "automode": self.automode_var.get(),
@@ -1064,12 +1118,10 @@ class CECClientGUI(tk.Tk):
             "raw_no_ack": self.raw_no_ack_var.get(),
             "raw_monitor": self.raw_monitor_var.get(),
             "geometry": self.geometry(),
+            "workbench": self._wb_preferences(),
         }
-        try:
-            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
-            self.settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError:
-            pass
+        self.settings = data
+        self.log_writer.replace_json(self.settings_path, data)
 
     def _create_variables(self) -> None:
         self.cec_path_var = tk.StringVar(value=str(DEFAULT_CEC))
@@ -1138,14 +1190,17 @@ class CECClientGUI(tk.Tk):
         self.capture_visible_tx_count = 0
         self.capture_visible_rx_count = 0
         self.capture_display_limit = 2000
-        self.capture_highlight_vars = [tk.StringVar(value="") for _ in range(4)]
+        self.capture_highlight_vars = [tk.StringVar(value="") for _ in range(HIGHLIGHT_RULE_COUNT)]
+        self.capture_highlight_color_vars = [tk.StringVar(value=color) for color, _ in HIGHLIGHT_PALETTE[:HIGHLIGHT_RULE_COUNT]]
+        self._capture_highlight_tags: dict[int, str] = {}
+        self._wb_loading_highlights = True
         self.capture_interval_var = tk.StringVar(value="时间间隔：未选择消息")
         self.capture_interval_marks: dict[int, int] = {}
         self.capture_context_item: str | None = None
         self.capture_context_column: str | None = None
-        self.capture_direction_var.trace_add("write", lambda *_args: self._refresh_capture_tree())
-        for highlight_var in self.capture_highlight_vars:
-            highlight_var.trace_add("write", lambda *_args: self._refresh_capture_tree())
+        self.capture_direction_var.trace_add("write", lambda *_args: self._wb_base_changed())
+        for highlight_var in (*self.capture_highlight_vars, *self.capture_highlight_color_vars):
+            highlight_var.trace_add("write", lambda *_args: self._wb_highlights_changed())
         self.topology_scan_pending = False
         self.scenario_running = False
         self.scenario_stop_event = threading.Event()
@@ -1219,15 +1274,11 @@ class CECClientGUI(tk.Tk):
                     var.set(self.settings[name])
                 except tk.TclError:
                     pass
-        saved_highlights = self.settings.get("capture_highlight_opcodes", [])
         saved_addresses = self.settings.get("occupancy_addresses")
         if isinstance(saved_addresses, list):
             for la, var in enumerate(self.occupancy_la_vars):
                 var.set(la in saved_addresses)
-        if isinstance(saved_highlights, list):
-            for highlight_var, value in zip(self.capture_highlight_vars, saved_highlights):
-                if isinstance(value, str):
-                    highlight_var.set(value)
+        self._wb_load_highlights()
         # Prefer the locally built raw-frame-enabled libCEC. The user can
         # still select another DLL manually after the GUI starts.
         if BUILT_CEC.is_file():
@@ -1304,6 +1355,7 @@ class CECClientGUI(tk.Tk):
         self.notebook.add(advanced_tab, text="高级工具")
         self.advanced_tab_widget = advanced_tab
         self.device_tab_widget = device_tab
+        self.capture_tab_widget = capture_tab
 
         self.session_notebook = ttk.Notebook(session_tab)
         self.session_notebook.pack(fill=BOTH, expand=True)
@@ -1855,14 +1907,15 @@ class CECClientGUI(tk.Tk):
             toolbar,
             text="显示 Polling",
             variable=self.capture_show_poll_var,
-            command=self._refresh_capture_tree,
+            command=self._wb_base_changed,
         ).pack(side=LEFT, padx=(0, 10))
         ttk.Label(toolbar, text="方向").pack(side=LEFT)
         RawValueCombobox(toolbar, raw_variable=self.capture_direction_var, options=CAPTURE_DIRECTION_OPTIONS, width=7, state="readonly").pack(side=LEFT, padx=4)
-        ttk.Label(toolbar, text="过滤").pack(side=LEFT, padx=(12, 0))
-        filter_entry = ttk.Entry(toolbar, textvariable=self.capture_filter_var, width=28)
+        ttk.Label(toolbar, text="搜索").pack(side=LEFT, padx=(8, 0))
+        filter_entry = ttk.Entry(toolbar, textvariable=self.capture_filter_var, width=20)
         filter_entry.pack(side=LEFT, padx=4)
-        filter_entry.bind("<KeyRelease>", lambda _event: self._refresh_capture_tree())
+        filter_entry.bind("<KeyRelease>", self._wb_schedule_query)
+        filter_entry.bind("<Return>", lambda _e: self._wb_apply_query())
         ttk.Button(toolbar, text="清空", command=self._clear_capture).pack(side=LEFT, padx=4)
         ttk.Button(toolbar, text="导出 CSV", command=self._export_capture_csv).pack(side=LEFT, padx=4)
         ttk.Button(toolbar, text="导出 JSON", command=self._export_capture_json).pack(side=LEFT, padx=4)
@@ -1871,28 +1924,8 @@ class CECClientGUI(tk.Tk):
         ttk.Checkbutton(toolbar, text="说明", variable=show_help,
                         command=lambda: help_frame.grid() if show_help.get() else help_frame.grid_remove()).pack(side=LEFT, padx=4)
 
-        highlight_frame = ttk.LabelFrame(parent, text="Opcode 关注（仅高亮命中的单元格）", padding=(4, 1))
-        highlight_frame.grid(row=1, column=0, sticky="ew", pady=(0, 3))
-        for column in (1, 3, 5, 7):
-            highlight_frame.columnconfigure(column, weight=1)
-        highlight_color_names = ("黄", "红", "蓝", "绿")
-        for index, highlight_var in enumerate(self.capture_highlight_vars):
-            column = index * 2
-            ttk.Label(
-                highlight_frame,
-                text=f"{index + 1}（{highlight_color_names[index]}）",
-            ).grid(row=0, column=column, sticky=E, padx=(3, 2), pady=1)
-            RawValueCombobox(
-                highlight_frame,
-                raw_variable=highlight_var,
-                options=HIGHLIGHT_OPCODE_OPTIONS,
-                width=20,
-                display_width_limit=30,
-                state="normal",
-            ).grid(row=0, column=column + 1, sticky="ew", padx=(0, 6 if column < 6 else 2), pady=1)
-
         interval_frame = ttk.LabelFrame(parent, text="时间间隔（右键两条消息分别设为时间点 1/2）", padding=(6, 3))
-        interval_frame.grid(row=2, column=0, sticky="ew", pady=(0, 3))
+        interval_frame.grid(row=1, column=0, sticky="ew", pady=(0, 3))
         interval_frame.columnconfigure(0, weight=1)
         ttk.Label(
             interval_frame,
@@ -1907,6 +1940,7 @@ class CECClientGUI(tk.Tk):
         help_frame = ttk.Frame(interval_frame)
         help_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(2, 0))
         for note in (
+            "双击消息查看完整详情；右键“载入 Raw 注入”可复制报文到发送页，等待手动发送。",
             "RX/TX 来自 libCEC rawFrame 原生回调；ACK 规则：单播 0=ACK/1=NACK，广播 1=ACK/0=NACK；行底色按 Source LA 区分。",
             "理论帧时长 = Start 4.5 ms + 每字节 24.0 ms；不含总线空闲、重试和响应等待。",
             "拖动表头分隔线调整列宽；双击分隔线按当前内容调整；重置列宽恢复紧凑布局。长报文、Opcode 和解释会自动换行。",
@@ -1914,18 +1948,19 @@ class CECClientGUI(tk.Tk):
             ttk.Label(help_frame, text=note, foreground="#666666", anchor=W, wraplength=920).pack(anchor=W)
         help_frame.grid_remove()
 
+        self._wb_create(parent, toolbar, RawValueCombobox, OPCODE_CATALOG_OPTIONS)
         frame = ttk.Frame(parent)
         frame.grid(row=3, column=0, sticky="nsew")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         columns = (
-            "seq", "time", "source", "destination", "frame",
+            "seq", "mark", "time", "source", "destination", "frame",
             "theoretical_duration_ms", "callback_interval_ms", "estimated_gap_ms",
             "opcode", "opcode_explanation", "params", "params_explanation", "status",
         )
         self.capture_tree = CaptureTable(frame, columns=columns)
         headings = {
-            "seq": "#", "time": "时间", "source": "源 LA",
+            "seq": "#", "mark": "标记", "time": "时间", "source": "源 LA",
             "destination": "目标 LA", "frame": "报文",
             "theoretical_duration_ms": "理论时长", "callback_interval_ms": "回调间隔",
             "estimated_gap_ms": "间隔−理论", "opcode": "Opcode",
@@ -1948,35 +1983,24 @@ class CECClientGUI(tk.Tk):
         for source, background in enumerate(source_colors):
             self.capture_tree.tag_configure(f"capture_source_{source:X}", background=background, foreground="#263238")
         self.capture_tree.tag_configure("capture_source_unknown", background="#F5F5F5", foreground="#37474F")
-        for tag, background, foreground, outline in (
-            ("capture_opcode_highlight_1", "#FFE68A", "#5A3D00", "#D39E00"),
-            ("capture_opcode_highlight_2", "#FF9E9E", "#641A1A", "#C62828"),
-            ("capture_opcode_highlight_3", "#9CCBFF", "#123E6B", "#1976D2"),
-            ("capture_opcode_highlight_4", "#A8E6A3", "#174F1D", "#2E7D32"),
-        ):
-            self.capture_tree.tag_configure(
-                tag,
-                background=background,
-                foreground=foreground,
-                outline=outline,
-            )
+        self._wb_apply_highlight_styles()
         yscroll = ttk.Scrollbar(frame, orient="vertical", command=self.capture_tree.yview)
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll = ttk.Scrollbar(frame, orient="horizontal", command=self.capture_tree.xview)
         xscroll.grid(row=1, column=0, sticky="ew")
         self.capture_tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-        self.capture_tree.bind("<Double-1>", self._capture_reuse_frame)
+        self.capture_tree.bind("<Double-1>", self._capture_show_details)
         self.capture_tree.bind("<Button-3>", self._capture_context_menu, add="+")
         self.capture_tree.bind("<Control-c>", self._copy_capture_current_row, add="+")
 
     def _reset_capture_columns(self) -> None:
         preferred = {
-            "seq": 42, "time": 106, "source": 52, "destination": 58, "frame": 140,
+            "seq": 42, "mark": 44, "time": 106, "source": 52, "destination": 58, "frame": 140,
             "theoretical_duration_ms": 82, "callback_interval_ms": 86, "estimated_gap_ms": 90,
             "opcode": 170, "opcode_explanation": 215, "params": 100, "params_explanation": 275, "status": 108,
         }
         minimum = {
-            "seq": 38, "time": 94, "source": 48, "destination": 54, "frame": 90,
+            "seq": 38, "mark": 42, "time": 94, "source": 48, "destination": 54, "frame": 90,
             "theoretical_duration_ms": 68, "callback_interval_ms": 68, "estimated_gap_ms": 76,
             "opcode": 120, "opcode_explanation": 110, "params": 65, "params_explanation": 145, "status": 80,
         }
@@ -2316,6 +2340,9 @@ class CECClientGUI(tk.Tk):
             self._cts_show_case(self.cts_result_tree.item(selection[0], "values")[0])
 
     def _cts_run_selected(self) -> None:
+        if self._wb_quick_busy:
+            self.status_var.set("请等待快捷命令发送结束，再运行 CTS")
+            return
         if self.backend.occupancy_mask or self.occupancy_busy:
             messagebox.showwarning(APP_NAME, "地址占用实验期间请使用占用页面观察 DUT；运行普通 CTS 项目前先释放占用。")
             return
@@ -2691,6 +2718,7 @@ class CECClientGUI(tk.Tk):
         self.advanced_notebook.select(self.command_page)
 
     def _bind_events(self) -> None:
+        self._wb_bind()
         self.command_tree.bind("<<TreeviewSelect>>", self._command_selected)
         self.command_tree.bind("<Double-1>", lambda _event: self._send_selected())
         self.raw_opcode_var.trace_add("write", self._raw_opcode_changed)
@@ -3099,6 +3127,7 @@ class CECClientGUI(tk.Tk):
             "status": status,
         }
         self.capture_records.append(record)
+        self._wb_on_record(record)
         self.capture_last_frame_at = time.monotonic()
         if direction == "TX":
             self.capture_last_tx = record
@@ -3164,6 +3193,7 @@ class CECClientGUI(tk.Tk):
         self._update_capture_refresh_state()
 
     def _update_capture_refresh_state(self) -> None:
+        self._wb_update_search_status()
         if self.capture_paused_var.get():
             mode = "显示已暂停（仍在记录）"
         elif self.capture_tree.is_at_bottom():
@@ -3183,6 +3213,8 @@ class CECClientGUI(tk.Tk):
                 if time.perf_counter() >= deadline:
                     break
                 kind, value = self.output_queue.get_nowait()
+                if self._wb_handle_output(kind, value):
+                    continue
                 if kind == "script_command":
                     self._send_command(str(value))
                 elif kind == "raw_command":
@@ -3263,50 +3295,14 @@ class CECClientGUI(tk.Tk):
             pass
 
     def _capture_record_matches_filter(self, record: dict) -> bool:
-        if record.get("opcode") is None and not self.capture_show_poll_var.get():
-            return False
-        direction = self.capture_direction_var.get()
-        if direction != "ALL" and record.get("direction") != direction:
-            return False
-        needle = self.capture_filter_var.get().strip().lower()
-        if needle:
-            haystack = " ".join(
-                str(record.get(key, ""))
-                for key in (
-                    "frame", "source", "destination", "opcode_text", "opcode_explanation",
-                    "frame_bytes", "theoretical_duration_ms", "callback_interval_ms",
-                    "estimated_gap_ms", "params", "params_explanation", "status",
-                )
-            ).lower()
-            if needle not in haystack:
-                return False
-        return True
+        return self._wb_base_matches(record) and (
+            self._wb_applied_mode == "FIND" or self.wb_query.matches(record, self._wb_annotation(record)))
 
     def _capture_highlight_opcodes(self) -> set[int]:
-        opcodes: set[int] = set()
-        for highlight_var in self.capture_highlight_vars:
-            value = highlight_var.get().strip()
-            if not value:
-                continue
-            try:
-                opcodes.add(self._parse_byte(value))
-            except (TypeError, ValueError):
-                continue
-        return opcodes
+        return set(self._capture_highlight_tags)
 
     def _capture_highlight_tag(self, opcode: object) -> str:
-        if not isinstance(opcode, int):
-            return ""
-        for index, highlight_var in enumerate(self.capture_highlight_vars, start=1):
-            value = highlight_var.get().strip()
-            if not value:
-                continue
-            try:
-                if self._parse_byte(value) == opcode:
-                    return f"capture_opcode_highlight_{index}"
-            except (TypeError, ValueError):
-                continue
-        return ""
+        return self._capture_highlight_tags.get(opcode, "") if isinstance(opcode, int) else ""
 
     def _capture_record_values_and_tags(self, record: dict) -> tuple[tuple[object, ...], tuple[str, ...]]:
         source = str(record.get("source", "")).strip().upper()
@@ -3319,7 +3315,7 @@ class CECClientGUI(tk.Tk):
         if direction in {"TX", "RX"}:
             tags.append(f"capture_direction_{direction}")
         values = (
-            record["seq"], record["time"], record["source"], record["destination"], record["frame"],
+            record["seq"], self._wb_record_mark(record), record["time"], record["source"], record["destination"], record["frame"],
             self._capture_duration_text(record.get("theoretical_duration_ms")),
             self._capture_duration_text(record.get("callback_interval_ms")),
             self._capture_duration_text(record.get("estimated_gap_ms")),
@@ -3365,8 +3361,8 @@ class CECClientGUI(tk.Tk):
             self.capture_tree.see_end()
         self._update_capture_summary()
 
-    def _refresh_capture_tree(self) -> None:
-        if not hasattr(self, "capture_tree") or self.capture_paused_var.get():
+    def _refresh_capture_tree(self, *, force: bool = False) -> None:
+        if not hasattr(self, "capture_tree") or (self.capture_paused_var.get() and not force):
             return
         selected_sequence = self._capture_selected_sequence()
         follow_tail = self.capture_tree.is_at_bottom()
@@ -3377,9 +3373,13 @@ class CECClientGUI(tk.Tk):
             self.capture_visible_tx_count = 0
             self.capture_visible_rx_count = 0
             sequence_items: dict[int, str] = {}
-            for record in self.capture_records[-self.capture_display_limit:]:
-                if not self._capture_record_matches_filter(record):
-                    continue
+            candidates = [record for record in self.capture_records if self._capture_record_matches_filter(record)]
+            visible = candidates[-self.capture_display_limit:]
+            selected_record = self._wb_records.get(selected_sequence)
+            if (selected_record is not None and self._capture_record_matches_filter(selected_record)
+                    and selected_record not in visible):
+                visible = [selected_record, *visible[-(self.capture_display_limit - 1):]]
+            for record in visible:
                 if record.get("direction") == "TX":
                     self.capture_visible_tx_count += 1
                 elif record.get("direction") == "RX":
@@ -3418,7 +3418,7 @@ class CECClientGUI(tk.Tk):
             return None
 
     def _capture_context_menu(self, event):
-        """Select the row under the pointer and show copy actions."""
+        """Select the clicked row; explicit actions retain its message snapshot."""
         item = self.capture_tree.identify_row(event.y)
         if not item:
             return "break"
@@ -3427,12 +3427,23 @@ class CECClientGUI(tk.Tk):
         self.capture_context_item = item
         self.capture_context_column = self.capture_tree.identify_column(event.x)
 
+        record = self._wb_current_record()
+        snapshot = dict(record) if record else None
         menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label="查看报文详情…", command=lambda: self._capture_show_details(record=snapshot),
+                         state="normal" if snapshot else "disabled")
+        menu.add_command(label="载入 Raw 注入", command=lambda: self._capture_reuse_frame(snapshot),
+                         state="normal" if snapshot else "disabled")
+        menu.add_separator()
         menu.add_command(label="复制当前单元格", command=self._copy_capture_cell)
         menu.add_command(label="复制整行（TSV）", command=self._copy_capture_current_row)
         menu.add_command(label="复制整行（含列名）", command=self._copy_capture_current_row_with_header)
         menu.add_separator()
         menu.add_command(label="复制报文", command=self._copy_capture_frame)
+        menu.add_separator()
+        is_bookmark = bool(record and self._wb_annotation(record).get("bookmark"))
+        menu.add_command(label="取消书签" if is_bookmark else "添加书签", command=self._wb_toggle_bookmark)
+        menu.add_command(label="编辑注释与标签…", command=self._wb_edit_annotation)
         menu.add_separator()
         menu.add_command(label="设为时间点 1（起点）", command=lambda: self._mark_capture_timepoint(1))
         menu.add_command(label="设为时间点 2（终点）", command=lambda: self._mark_capture_timepoint(2))
@@ -3597,6 +3608,7 @@ class CECClientGUI(tk.Tk):
 
     def _clear_capture(self) -> None:
         self.capture_records.clear()
+        self._wb_clear_session()
         self.capture_last_frame_at = None
         self._capture_display_dirty = False
         self.capture_interval_marks.clear()
@@ -3611,20 +3623,101 @@ class CECClientGUI(tk.Tk):
         self.capture_summary_var.set("当前显示 0 条：TX 0 / RX 0")
         self._refresh_capture_interval_display()
 
-    def _capture_reuse_frame(self, _event=None) -> None:
-        selection = self.capture_tree.selection()
-        if not selection:
+    def _capture_details_content(self, record: dict) -> str:
+        """Use the stored decode results; no device queries or new traffic."""
+        annotation = self._wb_annotation(record)
+        la_names = dict(LA_CHOICES)
+        source = str(record.get("source", "—"))
+        destination = str(record.get("destination", "—"))
+        timestamp = record.get("timestamp_ms")
+        timestamp_text = f"{timestamp} ms" if isinstance(timestamp, (int, float)) else "—"
+        fields = (
+            ("消息编号", f"#{record.get('seq', '—')}"),
+            ("时间", record.get("time", "—")),
+            ("方向", record.get("direction", "—")),
+            ("源 LA", f"{source} — {la_names.get(source.upper(), '未知')}"),
+            ("目标 LA", f"{destination} — {la_names.get(destination.upper(), '未知')}"),
+            ("完整报文", record.get("frame", "")),
+            ("Opcode", record.get("opcode_text", "—")),
+            ("ACK 状态", record.get("status", "—")),
+            ("Opcode 解释", record.get("opcode_explanation", "—")),
+            ("参数（Raw）", record.get("params") or "无参数"),
+            ("参数解释", record.get("params_explanation", "—")),
+            ("原生回调时间戳", timestamp_text),
+            ("理论帧时长", self._capture_duration_text(record.get("theoretical_duration_ms"))),
+            ("相邻回调间隔", self._capture_duration_text(record.get("callback_interval_ms"))),
+            ("回调间隔 − 本帧理论时长", self._capture_duration_text(record.get("estimated_gap_ms"))),
+            ("书签", "是" if annotation.get("bookmark") else "否"),
+            ("标签", ", ".join(annotation.get("tags", [])) or "—"),
+            ("注释", annotation.get("note") or "—"),
+        )
+        groups = (fields[:8], fields[8:11], fields[11:15], fields[15:])
+        return "\n\n".join("\n".join(f"{label}：{value}" for label, value in group) for group in groups)
+
+    def _capture_show_details(self, event=None, *, record: dict | None = None) -> tk.Toplevel | None:
+        if event is not None:
+            item = self.capture_tree.identify_row(event.y)
+            if not item:
+                return None
+            self.capture_tree.selection_set(item)
+            self.capture_tree.focus(item)
+            self.capture_context_item = item
+        if record is None:
+            record = self._wb_current_record()
+        if not record:
+            return None
+        snapshot = dict(record)
+        content = self._capture_details_content(snapshot)
+        dialog = tk.Toplevel(self)
+        dialog.title(f"CEC 报文详情 — #{snapshot.get('seq', '')}  {snapshot.get('time', '')}")
+        dialog.transient(self)
+        width = min(780, max(320, self.winfo_screenwidth() - 80))
+        height = min(700, max(320, self.winfo_screenheight() - 100))
+        dialog.geometry(f"{width}x{height}")
+        dialog.minsize(min(480, width), min(360, height))
+        body = ttk.Frame(dialog, padding=10)
+        body.pack(fill=BOTH, expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+        ttk.Label(body, text=f"#{snapshot.get('seq', '')}   {snapshot.get('source', '?')} → {snapshot.get('destination', '?')}   "
+                            f"{snapshot.get('opcode_text', '')}", wraplength=width - 40).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        text = tk.Text(body, wrap="word", font="TkDefaultFont", padx=10, pady=8, height=18)
+        text.grid(row=1, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        text.configure(yscrollcommand=scroll.set)
+        text.insert("1.0", content)
+        # Disabled Text remains selectable/copyable, and does not modify the capture.
+        text.configure(state="disabled")
+        buttons = ttk.Frame(body)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(buttons, text="复制报文", command=lambda: self._copy_to_clipboard(str(snapshot.get("frame", "")))).pack(side=LEFT)
+        ttk.Button(buttons, text="复制全部详情", command=lambda: self._copy_to_clipboard(content)).pack(side=LEFT, padx=6)
+        ttk.Button(buttons, text="关闭", command=dialog.destroy).pack(side=RIGHT)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.capture_detail_text = text
+        text.focus_set()
+        return dialog
+
+    def _capture_reuse_frame(self, record: dict | None = None) -> None:
+        record = record if record is not None else self._wb_current_record()
+        if not record:
             return
-        values = self.capture_tree.item(selection[0], "values")
-        if values:
-            columns = tuple(self.capture_tree["columns"])
-            try:
-                frame_index = columns.index("frame")
-            except ValueError:
-                return
-            self.raw_frame_var.set(str(values[frame_index]))
-            self.notebook.select(self.device_tab_widget)
-            self.device_notebook.select(self.raw_tab_widget)
+        frame_text = str(record.get("frame", ""))
+        try:
+            frame = self._parse_byte_list(frame_text)
+        except ValueError:
+            return
+        if not frame:
+            return
+        self.raw_source_var.set(f"{frame[0] >> 4:X}")
+        self.raw_destination_var.set(f"{frame[0] & 0x0F:X}")
+        self.raw_opcode_var.set(f"{frame[1]:02X}" if len(frame) > 1 else "")
+        self.raw_params_var.set(self._format_frame(frame[2:]))
+        self.raw_frame_var.set(frame_text)
+        self.notebook.select(self.device_tab_widget)
+        self.device_notebook.select(self.raw_tab_widget)
+        self.status_var.set(f"消息 #{record.get('seq', '')} 已载入 Raw 注入，待手动发送")
 
     def _export_capture_csv(self) -> None:
         path = filedialog.asksaveasfilename(title="导出 CEC 抓包 CSV", defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("所有文件", "*.*")])
@@ -3634,12 +3727,13 @@ class CECClientGUI(tk.Tk):
             "seq", "time", "timestamp_ms", "direction", "frame", "source", "destination",
             "frame_bytes", "theoretical_duration_ms", "callback_interval_ms", "estimated_gap_ms",
             "opcode_text", "opcode_explanation", "params", "params_explanation", "status",
+            "capture_session_id", "bookmark", "note", "tags",
         ]
         try:
             with Path(path).open("w", newline="", encoding="utf-8-sig") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
                 writer.writeheader()
-                writer.writerows(self.capture_records)
+                writer.writerows(dict(row, tags=", ".join(row.get("tags", []))) for row in self._wb_export_records())
         except OSError as exc:
             messagebox.showerror(APP_NAME, f"导出抓包失败：\n{exc}")
 
@@ -3648,7 +3742,7 @@ class CECClientGUI(tk.Tk):
         if not path:
             return
         try:
-            Path(path).write_text(json.dumps(self.capture_records, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.log_writer.replace_json(path, self._wb_export_records())
         except OSError as exc:
             messagebox.showerror(APP_NAME, f"导出抓包失败：\n{exc}")
 
@@ -4763,12 +4857,18 @@ class CECClientGUI(tk.Tk):
             except OSError:
                 pass
         self.backend.close()
-        self.log_writer.close()
         self._save_settings()
+        self.log_writer.close()
         self.destroy()
 
     def destroy(self) -> None:
         self._closing = True
+        if getattr(self, "_wb_highlight_save_job", None) is not None:
+            self.after_cancel(self._wb_highlight_save_job)
+            self._wb_highlight_save_job = None
+        if getattr(self, "_wb_query_job", None) is not None:
+            self.after_cancel(self._wb_query_job)
+            self._wb_query_job = None
         if self._poll_after_id is not None:
             self.after_cancel(self._poll_after_id)
             self._poll_after_id = None
@@ -4776,6 +4876,9 @@ class CECClientGUI(tk.Tk):
 
 
 def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "--self-test-report":
+        from portable_selftest import run_self_test
+        raise SystemExit(run_self_test(CECClientGUI, Path(sys.argv[2])))
     app = CECClientGUI()
     app.mainloop()
 

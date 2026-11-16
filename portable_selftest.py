@@ -1,0 +1,107 @@
+"""Offline portable-build check. Never open a serial port or send CEC frames."""
+import ctypes
+import hashlib
+import json
+from pathlib import Path
+import sys
+import traceback
+
+from runtime_paths import application_directory
+
+
+def run_self_test(gui_class, report_path: Path) -> int:
+    report = {"ok": False, "frozen": bool(getattr(sys, "frozen", False)),
+              "application_directory": str(application_directory()),
+              "working_directory": str(Path.cwd()), "adapter_opened": False}
+    app = None
+    connection = None
+    try:
+        app = gui_class(read_settings=False, start_hidden=True)
+        app.log_file_var.set("")
+        app.short_log_file_var.set("")
+        app.update_idletasks()
+        backend = app.backend
+        backend._load()
+        dll_path = Path(backend.dll_path).resolve()
+        report["dll"] = str(dll_path)
+        report["dll_sha256"] = hashlib.sha256(dll_path.read_bytes()).hexdigest()
+        report["test_ack_api"] = bool(backend._f_test_ack_set and backend._f_test_ack_get)
+        if not report["test_ack_api"]:
+            raise RuntimeError("Bundled DLL is missing the test ACK-mask API")
+        config = backend._new_configuration(monitor_only=True, physical_address=0x1000)
+        connection = backend._f_initialise(ctypes.byref(config))
+        if not connection:
+            raise RuntimeError("Native libCEC initialization failed")
+        report["libcec_info"] = backend._f_lib_info(connection).decode("utf-8", errors="replace")
+        backend._f_destroy(connection)
+        connection = None
+        report["oui"] = str(app.oui_lookup.path)
+        report["oui_entries"] = len(app.oui_lookup.entries)
+        report["sony_vendor"] = app.oui_lookup.describe(0x080046)
+        if report["oui_entries"] < 30000 or "sony" not in report["sony_vendor"].lower():
+            raise RuntimeError("Bundled OUI table did not load correctly")
+        backend._create_callbacks()
+        command = backend.frame_to_command([0x05, 0x90, 0])
+        backend._callbacks.rawFrame(None, ctypes.byref(command), 0, 1, 100)
+        app._poll_output()
+        app.update_idletasks()
+        report["capture_test_frame"] = app.capture_records[0]["frame"]
+        report["capture_rows"] = len(app.capture_tree.get_children())
+        report["cts_cases"] = len(app.cts_cases)
+        report["gui_errors"] = app.gui_error_count
+        if report["capture_rows"] != 1 or app.gui_error_count:
+            raise RuntimeError("Packaged GUI capture smoke check failed")
+        app.wb_query_vars["source"].set("0")
+        app.wb_query_vars["destination"].set("5")
+        app.wb_query_vars["opcode"].set("90")
+        if not app._wb_apply_query() or app._wb_matches != [1]:
+            raise RuntimeError("Packaged compound query check failed")
+        app.wb_annotations.set(app.capture_session_id, app.capture_records[0], bookmark=True,
+                               note="offline check", tags=["selftest"])
+        if app._wb_export_records()[0]["note"] != "offline check":
+            raise RuntimeError("Packaged annotation check failed")
+        report["workbench_commands"] = len(app.wb_commands)
+        report["workbench_search_matches"] = len(app._wb_matches)
+        report["workbench_annotation"] = True
+        app._wb_toggle("Opcode 关注", open_only=True)
+        app.capture_highlight_vars[11].set("90")
+        app.capture_highlight_color_vars[11].set("#492572")
+        tag = app._capture_highlight_tag(0x90)
+        if tag != "capture_opcode_highlight_12" or app.capture_tree._tags[tag]["background"] != "#492572":
+            raise RuntimeError("Packaged custom Opcode highlight check failed")
+        item = app.capture_tree.get_children()[0]
+        if tag not in app.capture_tree.item(item, "tags"):
+            raise RuntimeError("Packaged Opcode cell was not recolored")
+        app._wb_toggle("Opcode 关注")
+        app.update_idletasks()
+        if app.wb_panel.winfo_manager() or app.gui_error_count:
+            raise RuntimeError("Packaged highlight panel did not collapse correctly")
+        report["gui_errors"] = app.gui_error_count
+        report["highlight_rules"] = len(app.capture_highlight_vars)
+        report["highlight_custom_color"] = app.capture_tree._tags[tag]["background"]
+        previous_page = app.notebook.select()
+        dialog = app._capture_show_details(record=app.capture_records[0])
+        if dialog is None or app.notebook.select() != previous_page:
+            raise RuntimeError("Packaged capture details changed the main page")
+        content = dialog.capture_detail_text.get("1.0", "end-1c")
+        if "05:90:00" not in content or "Report Power Status" not in content:
+            raise RuntimeError("Packaged capture details are incomplete")
+        dialog.destroy()
+        app._capture_reuse_frame(app.capture_records[0])
+        if app.raw_frame_var.get() != "05:90:00" or app.raw_params_var.get() != "00":
+            raise RuntimeError("Packaged Raw load did not populate the frame")
+        report["capture_details"] = True
+        report["raw_frame_loaded"] = app.raw_frame_var.get()
+        report["ok"] = True
+    except Exception:
+        report["error"] = traceback.format_exc()
+    finally:
+        if app is not None:
+            if connection:
+                app.backend._f_destroy(connection)
+            app.log_writer.close()
+            app.destroy()
+        report_path = report_path.resolve()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 0 if report["ok"] else 1

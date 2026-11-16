@@ -22,8 +22,7 @@ class CaptureRefreshTests(unittest.TestCase):
         spec.loader.exec_module(cls.module)
 
     def setUp(self):
-        with patch.object(self.module.CECClientGUI, "_load_settings", return_value={}):
-            self.gui = self.module.CECClientGUI()
+        self.gui = self.module.CECClientGUI(read_settings=False)
         self.gui.withdraw()
         # Synthetic failure tests must not contaminate real diagnostic logs.
         self.write_patch = patch.object(self.gui.log_writer, "write")
