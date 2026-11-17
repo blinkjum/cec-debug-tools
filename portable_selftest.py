@@ -80,6 +80,31 @@ def run_self_test(gui_class, report_path: Path) -> int:
         report["workbench_commands"] = len(app.wb_commands)
         report["workbench_search_matches"] = len(app._wb_matches)
         report["workbench_annotation"] = True
+        if set(app.wb_condition_buttons) != {"source", "destination", "opcode"}:
+            raise RuntimeError("Packaged condition chips are incomplete")
+        app.wb_condition_buttons["source"].invoke()
+        if app.wb_query_vars["source"].get() or app.wb_query_vars["opcode"].get() != "90" or app._wb_matches != [1]:
+            raise RuntimeError("Packaged condition removal changed unrelated criteria")
+        report["removable_conditions"] = True
+        app.capture_filter_var.set("Report Power Status")
+        app._wb_navigate(1)
+        if "全文命中：Opcode" not in app.wb_match_reason.get():
+            raise RuntimeError("Packaged text search did not explain the matching field")
+        report["match_reasons"] = True
+        app.capture_filter_var.set("")
+        app._wb_apply_query()
+        app._layout_preset("COMPACT")
+        if "opcode_explanation" in app.capture_tree.display_columns:
+            raise RuntimeError("Packaged compact column preset failed")
+        layout = app._layout_preferences()
+        layout.update(visible=["frame", "opcode", "status"],
+                      order=["frame", *[c for c in layout["order"] if c != "frame"]], auto_fit=False)
+        layout["widths"]["frame"] = 321
+        app._layout_apply(json.loads(json.dumps(layout)))
+        if app.capture_tree.display_columns != ("frame", "opcode", "status") or app.capture_tree.column("frame", "width") != 321:
+            raise RuntimeError("Packaged custom column layout failed")
+        app._layout_preset("FULL")
+        report["column_layout"] = True
         app._wb_toggle("Opcode 关注", open_only=True)
         app.capture_highlight_vars[11].set("90")
         app.capture_highlight_color_vars[11].set("#492572")

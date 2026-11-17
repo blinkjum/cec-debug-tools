@@ -19,7 +19,7 @@ from libcec_backend import LibCecBackend
 SOURCE_FILES = (
     "cec-client-gui.py", "libcec_backend.py", "vendor_oui.py", "cts_testcases.py",
     "runtime_paths.py", "portable_selftest.py", "cec_workbench.py", "cec_workbench_ui.py", "README.md", "run-cec-client-gui.cmd",
-    "cec_capture_tools.py", "capture_files_ui.py",
+    "cec_capture_tools.py", "capture_files_ui.py", "capture_layout.py", "capture_layout_ui.py",
     "build-libcec-custom.ps1", "build-windows.ps1", ".gitignore", ".gitmodules",
 )
 
@@ -104,7 +104,7 @@ def main():
                 shutil.copy2(path, target)
     source_hashes = {path.relative_to(tool_source).as_posix(): digest(path)
                      for path in sorted(tool_source.rglob("*")) if path.is_file()}
-    info = {"product": "CEC Debug Tools", "platform": "Windows x64", "version": "2026.11.17.1",
+    info = {"product": "CEC Debug Tools", "platform": "Windows x64", "version": "2026.11.17.3",
             "built_at": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
             "python": platform.python_version(), "pyinstaller": metadata.version("pyinstaller"),
             "tool_base_commit": tool_revision, "libcec_commit": native_revision,
@@ -136,7 +136,8 @@ def main():
         "capture_test_frame", "capture_rows", "cts_cases", "gui_errors",
         "workbench_commands", "workbench_search_matches", "workbench_annotation",
         "highlight_rules", "highlight_custom_color", "capture_details", "raw_frame_loaded",
-        "offline_import", "length_check", "batch_export", "search_context_navigation")}
+        "offline_import", "length_check", "batch_export", "search_context_navigation",
+        "removable_conditions", "column_layout", "match_reasons")}
     (product / "build-info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     checksums = [f"{digest(path)}  {path.relative_to(product).as_posix()}" for path in sorted(product.rglob("*"))
                  if path.is_file()]

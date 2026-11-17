@@ -71,6 +71,11 @@ class CaptureWorkbenchMixin:
         self.wb_preset_var = tk.StringVar()
         self.wb_search_status = tk.StringVar(value="未设置查找条件")
         self.wb_search_summary = tk.StringVar()
+        self.wb_match_reason = tk.StringVar()
+        self._wb_reason_cache = None
+        self._wb_conditions_signature = None
+        self._wb_chips_job = None
+        self.wb_condition_buttons = {}
         self.wb_query_status = tk.StringVar(value="所有条件按 AND 组合；LA/Opcode可用逗号列出多个值")
         self.wb_note_preview = tk.StringVar(value="右键消息可添加书签、注释和标签；F2 / Shift+F2 跳转标记")
         self.wb_scope_var = tk.StringVar(value="全部会话")
@@ -81,22 +86,31 @@ class CaptureWorkbenchMixin:
         self.wb_quick_preview = tk.StringVar()
         self.wb_query = CaptureQuery()
         self._files_init()
+        self._layout_init(read_settings)
         for var in (*self.wb_query_vars.values(), self.wb_bookmarks_only, self.capture_filter_var):
             var.trace_add("write", lambda *_: self._wb_schedule_query())
         self.wb_mode_var.trace_add("write", lambda *_: self._wb_mode_changed())
 
     def _wb_preferences(self) -> dict:
         return {"quick_commands": [x.to_dict() for x in self.wb_commands],
-                "filter_presets": self.wb_filter_presets, "capture_files": self._files_preferences()}
+                "filter_presets": self.wb_filter_presets, "capture_files": self._files_preferences(),
+                "capture_layout": self._layout_preferences()}
 
     def _wb_create(self, parent, toolbar, combo_class, opcode_options) -> None:
         self._wb_combo = combo_class
         self._wb_opcode_options = opcode_options
-        controls = ttk.Frame(parent)
-        controls.grid(row=2, column=0, sticky="ew", pady=(0, 3))
+        group = ttk.Frame(parent)
+        group.grid(row=2, column=0, sticky="ew", pady=(0, 3))
+        controls = ttk.Frame(group)
+        controls.pack(fill="x")
         pages = ("快捷命令", "组合查找", "书签注释", "Opcode 关注", "日志工具")
         for name in pages:
             ttk.Button(controls, text=name, width=0, command=lambda page=name: self._wb_toggle(page)).pack(side="left", padx=(0, 4))
+        ttk.Label(controls, text="全文搜索").pack(side="left", padx=(4, 0))
+        self.wb_text_entry = ttk.Entry(controls, textvariable=self.capture_filter_var, width=20)
+        self.wb_text_entry.pack(side="left", padx=4)
+        self.wb_text_entry.bind("<KeyRelease>", self._wb_schedule_query)
+        self.wb_text_entry.bind("<Return>", lambda _e: self._wb_apply_query())
         self.wb_previous_button = ttk.Button(controls, text="上一命中", width=0, state="disabled", command=lambda: self._wb_navigate(-1))
         self.wb_previous_button.pack(side="left", padx=2)
         self.wb_next_button = ttk.Button(controls, text="下一命中", width=0, state="disabled", command=lambda: self._wb_navigate(1))
@@ -107,7 +121,20 @@ class CaptureWorkbenchMixin:
         self.wb_latest_button = ttk.Button(controls, text="返回最新", width=0, command=self._wb_latest)
         self.wb_latest_button.pack(side="right")
         ttk.Label(controls, textvariable=self.wb_search_status).pack(side="right", padx=6)
-        ttk.Label(controls, textvariable=self.wb_search_summary, width=1).pack(side="left", fill="x", expand=True, padx=3)
+        self.wb_condition_area = ttk.Frame(group)
+        self.wb_condition_row = ttk.Frame(self.wb_condition_area)
+        self.wb_condition_row.pack(fill="x", pady=(3, 0))
+        self.wb_condition_row.columnconfigure(1, weight=1)
+        self.wb_condition_caption = ttk.Label(self.wb_condition_row, text="查找条件")
+        self.wb_condition_caption.grid(row=0, column=0, sticky="nw", padx=(0, 5), pady=4)
+        self.wb_condition_chips = ttk.Frame(self.wb_condition_row, height=27)
+        self.wb_condition_chips.grid(row=0, column=1, sticky="ew")
+        self.wb_condition_chips.bind("<Configure>", self._wb_schedule_chip_layout)
+        self.wb_clear_conditions_button = ttk.Button(self.wb_condition_row, text="清除查找", width=0, command=self._wb_clear_query)
+        self.wb_clear_conditions_button.grid(row=0, column=2, sticky="ne", padx=(6, 0))
+        self.wb_match_reason_label = ttk.Label(self.wb_condition_area, textvariable=self.wb_match_reason, foreground="#35546B", wraplength=950)
+        self.wb_match_reason_label.pack(anchor="w", fill="x", pady=(2, 0))
+        self.wb_condition_area.bind("<Configure>", lambda event: self.wb_match_reason_label.configure(wraplength=max(200, event.width - 8)))
         self.wb_panel = ttk.Notebook(parent, height=244)
         self.wb_panel.grid(row=4, column=0, sticky="ew", pady=(3, 0))
         self.wb_pages = {name: ttk.Frame(self.wb_panel, padding=4) for name in pages}
@@ -549,7 +576,7 @@ class CaptureWorkbenchMixin:
         ttk.Button(actions, text="保存条件", command=self._wb_save_filter).pack(side="left", padx=4)
         ttk.Button(actions, text="删除条件", command=self._wb_delete_filter).pack(side="left")
         ttk.Label(parent, textvariable=self.wb_query_status, foreground="#555555", wraplength=950).grid(row=3, column=0, columnspan=6, sticky="w", pady=4)
-        ttk.Label(parent, text="参数按前缀匹配：?? 任意字节、A? 任意低半字节，例如 01:??:A?。顶部文字同时搜索报文、解释、注释和标签。\nCtrl+F 打开；F3 / Shift+F3 前后定位，命中可跨越2000条显示窗口。", foreground="#555555", wraplength=1020).grid(row=4, column=0, columnspan=6, sticky="w", pady=3)
+        ttk.Label(parent, text="参数按前缀匹配：?? 任意字节、A? 任意低半字节，例如 01:??:A?。全文搜索同时匹配报文、解释、注释和标签，输入框在命中导航按钮左侧。\nCtrl+F 打开；F3 / Shift+F3 前后定位，命中可跨越2000条显示窗口。", foreground="#555555", wraplength=1020).grid(row=4, column=0, columnspan=6, sticky="w", pady=3)
 
     def _wb_query_data(self) -> dict:
         return {**{k: v.get() for k, v in self.wb_query_vars.items()}, "text": self.capture_filter_var.get(),
@@ -653,7 +680,89 @@ class CaptureWorkbenchMixin:
             for button in (self.wb_previous_button, self.wb_next_button):
                 button.configure(state="normal" if active and self._wb_matches else "disabled")
             self.wb_only_matches_button.configure(state="normal" if active else "disabled")
+            self._wb_update_condition_views()
         self._wb_search_dirty = False
+
+    def _wb_update_condition_views(self) -> None:
+        if self._wb_query_valid:
+            conditions = self.wb_query.conditions()
+        else:
+            data = self._wb_query_data()
+            labels = {"source": "源LA", "destination": "目标LA", "opcode": "Opcode", "status": "状态", "params": "参数", "text": "文字"}
+            conditions = [(key, f"{label}={str(data[key]).strip()}") for key, label in labels.items() if str(data[key]).strip()]
+            if data["bookmarks_only"]:
+                conditions.append(("bookmarks_only", "仅书签"))
+        signature = (self._wb_query_valid, tuple(conditions))
+        if signature != self._wb_conditions_signature:
+            self._wb_conditions_signature = signature
+            for button in self.wb_condition_buttons.values():
+                button.destroy()
+            self.wb_condition_buttons.clear()
+            self.wb_condition_caption.configure(text="查找条件" if self._wb_query_valid else "待修正")
+            for key, label in conditions:
+                short = label if len(label) <= 32 else label[:29] + "…"
+                self.wb_condition_buttons[key] = ttk.Button(self.wb_condition_chips, text=short + " ×", width=0,
+                                                           command=lambda k=key: self._wb_remove_condition(k))
+            if conditions:
+                self.wb_condition_area.pack(fill="x")
+                self._wb_schedule_chip_layout()
+            else:
+                self.wb_condition_area.pack_forget()
+        self._wb_update_match_reason()
+
+    def _wb_schedule_chip_layout(self, _event=None) -> None:
+        if self._wb_chips_job is not None:
+            self.after_cancel(self._wb_chips_job)
+        self._wb_chips_job = self.after_idle(self._wb_layout_chips)
+
+    def _wb_layout_chips(self) -> None:
+        self._wb_chips_job = None
+        available = max(100, self.wb_condition_chips.winfo_width())
+        x = y = 0
+        height = max((b.winfo_reqheight() for b in self.wb_condition_buttons.values()), default=27)
+        for button in self.wb_condition_buttons.values():
+            width = min(available, button.winfo_reqwidth())
+            if x and x + width > available:
+                x, y = 0, y + height + 3
+            button.place(x=x, y=y, width=width, height=height)
+            x += width + 4
+        self.wb_condition_chips.configure(height=y + height)
+
+    def _wb_remove_condition(self, key: str) -> None:
+        if key in self.wb_query_vars:
+            self.wb_query_vars[key].set("")
+        elif key == "text":
+            self.capture_filter_var.set("")
+        elif key == "bookmarks_only":
+            self.wb_bookmarks_only.set(False)
+        self._wb_apply_query()
+
+    def _wb_reason_for_record(self, record: dict) -> str:
+        if not self._wb_query_valid:
+            return "条件有误，修改尚未应用；上一次有效条件仍然生效"
+        if not self.wb_query.has_conditions:
+            return "未设置查找条件"
+        if not self._wb_base_matches(record):
+            return "当前消息不在显示范围内（方向 / Polling / 仅非法数据块）"
+        reasons = self.wb_query.explain_match(record, self._wb_annotation(record))
+        return "；".join(reasons) if reasons else "当前消息未命中查找条件"
+
+    def _wb_update_match_reason(self) -> None:
+        record = self._wb_current_record()
+        annotation = self._wb_annotation(record) if record else {}
+        key = (self.wb_query, self._wb_query_valid, record.get("seq") if record else None,
+               annotation.get("note"), tuple(annotation.get("tags", [])), annotation.get("bookmark"),
+               self.capture_direction_var.get(), self.capture_show_poll_var.get(), self._files_errors_only.get(), self.capture_session_id)
+        if key == self._wb_reason_cache:
+            return
+        self._wb_reason_cache = key
+        if not self._wb_query_valid:
+            text = "条件有误，修改尚未应用；请移除或修正错误条件"
+        elif record:
+            text = f"消息 #{record['seq']}：" + self._wb_reason_for_record(record)
+        else:
+            text = "选中消息或使用上一 / 下一命中，查看匹配字段与内容"
+        self.wb_match_reason.set("命中原因：" + (text if len(text) <= 260 else text[:257] + "…（完整内容见报文详情）"))
 
     def _wb_navigate(self, direction: int) -> None:
         if not self._wb_apply_query() or not self._wb_matches:
@@ -702,9 +811,12 @@ class CaptureWorkbenchMixin:
         self._capture_follow_suspended = True
         self.capture_tree.selection_set(item)
         self.capture_tree.focus(item)
-        self.capture_tree.see(item, center=True)
         self._wb_selection_changed()
         self._update_capture_refresh_state()
+        # Chips and match reasons can change the viewport height. Finish
+        # geometry/painting before centering; do not pump adapter events.
+        self.update_idletasks()
+        self.capture_tree.see(item, center=True)
 
     def _wb_latest(self) -> None:
         self._files_show_live()

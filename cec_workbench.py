@@ -177,6 +177,20 @@ def parameter_mask(text: str) -> tuple[tuple[int, int], ...]:
     return tuple(result)
 
 
+SEARCH_RECORD_FIELDS = (
+    ("报文", "frame"), ("源 LA", "source"), ("目标 LA", "destination"),
+    ("Opcode", "opcode_text"), ("Opcode 解释", "opcode_explanation"), ("字节数", "frame_bytes"),
+    ("理论帧时长", "theoretical_duration_ms"), ("回调间隔", "callback_interval_ms"),
+    ("间隔−理论", "estimated_gap_ms"), ("参数", "params"), ("参数解释", "params_explanation"),
+    ("ACK 状态", "status"), ("长度检查状态", "length_status"), ("长度检查说明", "length_message"),
+)
+
+
+def search_fields(record: dict, annotation: dict) -> list[tuple[str, str]]:
+    return [(label, str(record.get(key, ""))) for label, key in SEARCH_RECORD_FIELDS] + [
+        ("注释", str(annotation.get("note", ""))), ("标签", " ".join(annotation.get("tags", [])))]
+
+
 @dataclass(frozen=True)
 class CaptureQuery:
     sources: frozenset = frozenset()
@@ -193,25 +207,44 @@ class CaptureQuery:
                     or self.parameters or self.text or self.bookmarks_only)
 
     def describe(self) -> str:
+        return "；".join(text for _key, text in self.conditions())
+
+    def conditions(self) -> list[tuple[str, str]]:
         parts = []
-        for label, values, width in (("源LA", self.sources, 1), ("目标LA", self.destinations, 1),
-                                     ("Opcode", self.opcodes, 2)):
+        for key, label, values, width in (("source", "源LA", self.sources, 1), ("destination", "目标LA", self.destinations, 1),
+                                          ("opcode", "Opcode", self.opcodes, 2)):
             if values:
                 raw = [f"{value:0{width}X}" for value in sorted(v for v in values if v is not None)]
                 if None in values:
                     raw.append("POLL")
-                parts.append(f"{label}={','.join(raw)}")
+                parts.append((key, f"{label}={','.join(raw)}"))
         if self.status:
-            parts.append(f"状态={self.status}")
+            parts.append(("status", f"状态={self.status}"))
         if self.parameters:
             tokens = ["".join(f"{(value >> shift) & 15:X}" if mask & (15 << shift) else "?"
                               for shift in (4, 0)) for mask, value in self.parameters]
-            parts.append("参数=" + ":".join(tokens))
+            parts.append(("params", "参数=" + ":".join(tokens)))
         if self.text:
-            parts.append(f"文字={self.text}")
+            parts.append(("text", f"文字={self.text}"))
         if self.bookmarks_only:
-            parts.append("仅书签")
-        return "；".join(parts)
+            parts.append(("bookmarks_only", "仅书签"))
+        return parts
+
+    def explain_match(self, record: dict, annotation: dict | None = None) -> list[str]:
+        annotation = annotation or {}
+        if not self.has_conditions or not self.matches(record, annotation):
+            return []
+        reasons = [text for key, text in self.conditions() if key != "text"]
+        if self.text:
+            hits = []
+            for label, value in search_fields(record, annotation):
+                if self.text in value.casefold():
+                    flat = value.replace("\n", " ")
+                    index = max(0, flat.casefold().find(self.text) - 15)
+                    snippet = ("…" if index else "") + flat[index:index+65] + ("…" if len(flat) > index+65 else "")
+                    hits.append(f"{label}「{snippet}」")
+            reasons.append("全文命中：" + ("、".join(hits) if hits else "跨字段内容"))
+        return reasons
 
     @classmethod
     def from_dict(cls, data: dict) -> "CaptureQuery":
@@ -248,11 +281,7 @@ class CaptureQuery:
         if self.bookmarks_only and not annotation.get("bookmark"):
             return False
         if self.text:
-            haystack = " ".join(str(record.get(key, "")) for key in (
-                "frame", "source", "destination", "opcode_text", "opcode_explanation", "frame_bytes",
-                "theoretical_duration_ms", "callback_interval_ms", "estimated_gap_ms", "params",
-                "params_explanation", "status", "length_status", "length_message"))
-            haystack += " " + str(annotation.get("note", "")) + " " + " ".join(annotation.get("tags", []))
+            haystack = " ".join(value for _label, value in search_fields(record, annotation))
             if self.text not in haystack.casefold():
                 return False
         return True

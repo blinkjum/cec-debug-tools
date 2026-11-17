@@ -35,6 +35,8 @@ from cec_workbench_ui import CaptureWorkbenchMixin, LA_CHOICES
 from cec_workbench import HIGHLIGHT_PALETTE, HIGHLIGHT_RULE_COUNT
 from capture_files_ui import CaptureFilesMixin
 from cec_capture_tools import write_export
+from capture_layout import CAPTURE_COLUMNS, CAPTURE_HEADINGS, MINIMUM_WIDTHS, PREFERRED_WIDTHS
+from capture_layout_ui import CaptureLayoutMixin
 
 
 APP_NAME = "CEC Client GUI"
@@ -401,6 +403,8 @@ class CaptureTable(ttk.Frame):
     def __init__(self, master: tk.Misc, *, columns: tuple[str, ...]) -> None:
         super().__init__(master)
         self.columns = tuple(columns)
+        self.display_columns = self.columns
+        self.auto_fit_columns = True
         self._headings: dict[str, str] = {column: column for column in self.columns}
         self._widths: dict[str, int] = {column: 100 for column in self.columns}
         self._items: dict[str, dict[str, object]] = {}
@@ -487,8 +491,9 @@ class CaptureTable(ttk.Frame):
         _first, last = self.body_canvas.yview()
         return last >= 0.999
 
-    def set_column_layout(self, preferred: dict[str, int], minimum: dict[str, int]) -> None:
+    def set_column_layout(self, preferred: dict[str, int], minimum: dict[str, int], *, auto_fit: bool = True) -> None:
         """Fit only on window resize/user request, never on incoming traffic."""
+        self.auto_fit_columns = auto_fit
         self._minimum_widths = {
             column: max(minimum[column], self._header_font.measure(self._headings[column]) + 12)
             for column in self.columns
@@ -498,6 +503,28 @@ class CaptureTable(ttk.Frame):
         }
         self._apply_column_widths(self._preferred_widths)
         self.fit_columns()
+
+    def set_display_columns(self, columns) -> None:
+        columns = tuple(dict.fromkeys(c for c in columns if c in self.columns))
+        if not columns:
+            raise ValueError("至少显示一列")
+        if columns == self.display_columns:
+            return
+        follow = self.is_at_bottom()
+        top = max(0, self.body_canvas.canvasy(0))
+        anchor = self.identify_row(0)
+        within = top - self._row_offsets[self._order.index(anchor)] if anchor else 0
+        self.display_columns = columns
+        for item in self._order:
+            self._row_heights[item] = self._measure_row_height(item)
+        self._redraw()
+        self.fit_columns()
+        self.xview("moveto", 0)
+        if follow:
+            self.see_end()
+        elif anchor:
+            offset = self._row_offsets[self._order.index(anchor)] + min(within, self._row_heights[anchor]-1)
+            self.yview("moveto", offset / max(1, self._row_offsets[-1]))
 
     def _on_body_configure(self, _event=None) -> None:
         self._request_render()
@@ -510,7 +537,7 @@ class CaptureTable(ttk.Frame):
         if self._layout_job is not None:
             self.after_cancel(self._layout_job)
             self._layout_job = None
-        if not self._preferred_widths:
+        if not self._preferred_widths or (not self.auto_fit_columns and available is None):
             return
         if available is None:
             available = self.body_canvas.winfo_width()
@@ -518,20 +545,22 @@ class CaptureTable(ttk.Frame):
             return
         preferred = self._preferred_widths
         minimum = self._minimum_widths
-        budget = max(sum(minimum.values()), min(available, sum(preferred.values())))
-        extra = budget - sum(minimum.values())
-        flexibility = sum(preferred[c] - minimum[c] for c in self.columns)
+        columns = self.display_columns
+        minimum_total = sum(minimum[c] for c in columns)
+        budget = max(minimum_total, min(available, sum(preferred[c] for c in columns)))
+        extra = budget - minimum_total
+        flexibility = sum(preferred[c] - minimum[c] for c in columns)
         widths = {c: minimum[c] + (extra * (preferred[c] - minimum[c]) // flexibility if flexibility else 0)
-                  for c in self.columns}
+                  for c in columns}
         remaining = budget - sum(widths.values())
-        for column in self.columns:
+        for column in columns:
             if remaining and widths[column] < preferred[column]:
                 widths[column] += 1
                 remaining -= 1
         self._apply_column_widths(widths)
 
     def _apply_column_widths(self, widths: dict[str, int]) -> None:
-        if all(self._widths[c] == widths[c] for c in self.columns):
+        if all(self._widths[c] == width for c, width in widths.items()):
             return
         follow_tail = self.is_at_bottom()
         top = max(0.0, self.body_canvas.canvasy(0))
@@ -548,13 +577,13 @@ class CaptureTable(ttk.Frame):
         elif anchor >= 0:
             position = self._row_offsets[anchor] + min(within_row, self._row_heights[self._order[anchor]] - 1)
             self.yview("moveto", position / max(1, self._row_offsets[-1]))
-        if sum(self._widths.values()) <= self.body_canvas.winfo_width():
+        if sum(self._widths[c] for c in self.display_columns) <= self.body_canvas.winfo_width():
             self.xview("moveto", 0)
 
     def _header_edge(self, x: int) -> str | None:
         position = self.header_canvas.canvasx(x)
         offset = 0
-        for column in self.columns:
+        for column in self.display_columns:
             offset += self._widths[column]
             if abs(position - offset) <= 5:
                 return column
@@ -584,7 +613,9 @@ class CaptureTable(ttk.Frame):
             widths[column] = max(self._minimum_widths.get(column, 40),
                                  int(original + self.header_canvas.canvasx(event.x) - start))
             self._preferred_widths = dict(widths)
+            self.auto_fit_columns = False
             self._apply_column_widths(widths)
+            self._notify_column_resize()
 
     def _on_header_autofit(self, event: tk.Event) -> None:
         column = self._header_edge(event.x)
@@ -597,7 +628,14 @@ class CaptureTable(ttk.Frame):
         widths = dict(self._widths)
         widths[column] = max(self._minimum_widths.get(column, 40), min(480, width))
         self._preferred_widths = dict(widths)
+        self.auto_fit_columns = False
         self._apply_column_widths(widths)
+        self._notify_column_resize()
+
+    def _notify_column_resize(self) -> None:
+        callback = getattr(self, "on_column_resize", None)
+        if callback:
+            callback()
 
     def see_end(self) -> None:
         self.body_canvas.yview_moveto(1.0)
@@ -710,10 +748,10 @@ class CaptureTable(ttk.Frame):
     def identify_column(self, x: int) -> str:
         position = self.body_canvas.canvasx(x)
         offset = 0
-        for index, column in enumerate(self.columns, start=1):
+        for column in self.display_columns:
             offset += self._widths[column]
             if position < offset:
-                return f"#{index}"
+                return f"#{self.columns.index(column) + 1}"
         return ""
 
     def begin_update(self) -> None:
@@ -773,14 +811,14 @@ class CaptureTable(ttk.Frame):
     def _redraw(self) -> None:
         if not hasattr(self, "body_canvas") or self._batch_depth:
             return
-        total_width = sum(self._widths[column] for column in self.columns)
+        total_width = sum(self._widths[column] for column in self.display_columns)
         self.header_canvas.delete("all")
         self.header_canvas.configure(scrollregion=(0, 0, total_width, self._header_height))
         self._rebuild_offsets()
         self._update_scrollregion()
 
         offset = 0
-        for column in self.columns:
+        for column in self.display_columns:
             width = self._widths[column]
             self.header_canvas.create_rectangle(offset, 0, offset + width, self._header_height, fill="#F2F2F2", outline="#D5D5D5")
             self.header_canvas.create_text(offset + 5, self._header_height / 2, text=self._headings[column], anchor="w", font=self._header_font, fill="#202020")
@@ -826,7 +864,7 @@ class CaptureTable(ttk.Frame):
         super().destroy()
 
     def _update_scrollregion(self) -> None:
-        total_width = sum(self._widths[column] for column in self.columns)
+        total_width = sum(self._widths[column] for column in self.display_columns)
         total_height = self._row_offsets[-1]
         self.body_canvas.configure(scrollregion=(0, 0, total_width, total_height))
 
@@ -860,7 +898,8 @@ class CaptureTable(ttk.Frame):
         data = self._items.get(item_id, {})
         values = tuple(data.get("values", ()))
         max_lines = 1
-        for value_index, column in enumerate(self.columns):
+        for column in self.display_columns:
+            value_index = self.columns.index(column)
             if column not in self._wrap_columns or value_index >= len(values):
                 continue
             wrapped = self._wrap_text(values[value_index], max(20, self._widths[column] - 10))
@@ -888,7 +927,8 @@ class CaptureTable(ttk.Frame):
         y1 = y0 + row_height
         offset = 0
         canvas_tags = ("capture_row", f"capture_item_{item_id}")
-        for value_index, column in enumerate(self.columns):
+        for column in self.display_columns:
+            value_index = self.columns.index(column)
             width = self._widths[column]
             cell_background = row_background
             cell_foreground = row_foreground
@@ -1049,7 +1089,7 @@ class AsyncLogWriter:
             close_event.set()
 
 
-class CECClientGUI(CaptureFilesMixin, CaptureWorkbenchMixin, tk.Tk):
+class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin, tk.Tk):
     def __init__(self, *, read_settings: bool = True, start_hidden: bool = False) -> None:
         super().__init__()
         if start_hidden:
@@ -1943,15 +1983,12 @@ class CECClientGUI(CaptureFilesMixin, CaptureWorkbenchMixin, tk.Tk):
         ).pack(side=LEFT, padx=(0, 10))
         ttk.Label(toolbar, text="方向").pack(side=LEFT)
         RawValueCombobox(toolbar, raw_variable=self.capture_direction_var, options=CAPTURE_DIRECTION_OPTIONS, width=7, state="readonly").pack(side=LEFT, padx=4)
-        ttk.Label(toolbar, text="搜索").pack(side=LEFT, padx=(8, 0))
-        filter_entry = ttk.Entry(toolbar, textvariable=self.capture_filter_var, width=20)
-        filter_entry.pack(side=LEFT, padx=4)
-        filter_entry.bind("<KeyRelease>", self._wb_schedule_query)
-        filter_entry.bind("<Return>", lambda _e: self._wb_apply_query())
         ttk.Button(toolbar, text="清空", command=self._clear_capture).pack(side=LEFT, padx=4)
         ttk.Button(toolbar, text="导出 CSV", command=self._export_capture_csv).pack(side=LEFT, padx=4)
         ttk.Button(toolbar, text="导出 JSON", command=self._export_capture_json).pack(side=LEFT, padx=4)
         ttk.Button(toolbar, text="重置列宽", command=self._reset_capture_columns).pack(side=LEFT, padx=4)
+        self.capture_layout_button = ttk.Button(toolbar, text="列布局", command=self._layout_show_menu)
+        self.capture_layout_button.pack(side=LEFT, padx=4)
         show_help = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text="说明", variable=show_help,
                         command=lambda: help_frame.grid() if show_help.get() else help_frame.grid_remove()).pack(side=LEFT, padx=4)
@@ -1985,23 +2022,14 @@ class CECClientGUI(CaptureFilesMixin, CaptureWorkbenchMixin, tk.Tk):
         frame.grid(row=3, column=0, sticky="nsew")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
-        columns = (
-            "seq", "mark", "time", "source", "destination", "frame",
-            "theoretical_duration_ms", "callback_interval_ms", "estimated_gap_ms",
-            "opcode", "opcode_explanation", "params", "params_explanation", "status",
-        )
+        columns = CAPTURE_COLUMNS
         self.capture_tree = CaptureTable(frame, columns=columns)
-        headings = {
-            "seq": "#", "mark": "标记", "time": "时间", "source": "源 LA",
-            "destination": "目标 LA", "frame": "报文",
-            "theoretical_duration_ms": "理论时长", "callback_interval_ms": "回调间隔",
-            "estimated_gap_ms": "间隔−理论", "opcode": "Opcode",
-            "opcode_explanation": "Opcode 解释", "params": "参数",
-            "params_explanation": "参数解释", "status": "ACK 状态",
-        }
+        headings = CAPTURE_HEADINGS
         for column in columns:
             self.capture_tree.heading(column, text=headings[column])
-        self._reset_capture_columns()
+        self._layout_install()
+        self.capture_tree.on_column_resize = self._layout_changed
+        self.capture_tree.header_canvas.bind("<Button-3>", self._layout_show_menu)
         self.capture_tree.grid(row=0, column=0, sticky="nsew")
         # Use a soft, deterministic color per source LA.  The source and
         # destination columns remain visible, so the color is only a visual
@@ -2029,17 +2057,8 @@ class CECClientGUI(CaptureFilesMixin, CaptureWorkbenchMixin, tk.Tk):
         self.capture_tree.bind("<Control-a>", self._capture_select_all, add="+")
 
     def _reset_capture_columns(self) -> None:
-        preferred = {
-            "seq": 42, "mark": 44, "time": 106, "source": 52, "destination": 58, "frame": 140,
-            "theoretical_duration_ms": 82, "callback_interval_ms": 86, "estimated_gap_ms": 90,
-            "opcode": 170, "opcode_explanation": 215, "params": 100, "params_explanation": 275, "status": 108,
-        }
-        minimum = {
-            "seq": 38, "mark": 42, "time": 94, "source": 48, "destination": 54, "frame": 90,
-            "theoretical_duration_ms": 68, "callback_interval_ms": 68, "estimated_gap_ms": 76,
-            "opcode": 120, "opcode_explanation": 110, "params": 65, "params_explanation": 145, "status": 80,
-        }
-        self.capture_tree.set_column_layout(preferred, minimum)
+        self.capture_tree.set_column_layout(PREFERRED_WIDTHS, MINIMUM_WIDTHS)
+        self._layout_changed()
 
     def _create_scenario_tab(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(1, weight=1)
@@ -3738,6 +3757,8 @@ class CECClientGUI(CaptureFilesMixin, CaptureWorkbenchMixin, tk.Tk):
         groups = (fields[:8], fields[8:11], fields[11:15], fields[15:])
         content = "\n\n".join("\n".join(f"{label}：{value}" for label, value in group) for group in groups)
         content += f"\n\n长度检查：{record.get('length_status', 'NOT_COVERED')}\n{record.get('length_message', '暂无检查结果')}"
+        if self.wb_query.has_conditions or not self._wb_query_valid:
+            content += "\n\n查找命中原因：" + self._wb_reason_for_record(record)
         if "origin_seq" in record:
             content += f"\n\n离线导入前编号：{record['origin_seq']}\n原会话：{record.get('origin_capture_session_id') or '—'}"
         return content
@@ -4931,6 +4952,11 @@ class CECClientGUI(CaptureFilesMixin, CaptureWorkbenchMixin, tk.Tk):
 
     def destroy(self) -> None:
         self._closing = True
+        for name in ("_layout_save_job", "_wb_chips_job"):
+            job = getattr(self, name, None)
+            if job is not None:
+                self.after_cancel(job)
+                setattr(self, name, None)
         if getattr(self, "_files_load_job", None) is not None:
             self.after_cancel(self._files_load_job)
             self._files_load_job = None
