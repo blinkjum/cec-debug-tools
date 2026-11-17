@@ -19,6 +19,22 @@ def run_self_test(gui_class, report_path: Path) -> int:
     connection = None
     try:
         app = gui_class(read_settings=False, start_hidden=True)
+        report["task_pages"] = [app.notebook.tab(page, "text") for page in app.notebook.tabs()]
+        report["default_monitor"] = app.notebook.select() == str(app.capture_tab_widget)
+        if report["task_pages"] != ["报文监视", "发包与模拟", "设备与拓扑", "测试与报告"] or not report["default_monitor"]:
+            raise RuntimeError("Packaged application has incorrect task pages or default page")
+        if app.script_text is not app.scenario_text or app.diagnostics_window.state() != "withdrawn":
+            raise RuntimeError("Packaged shared script editor or hidden diagnostics failed")
+        from cec_scripts import compile_script
+        old = compile_script(["scan", "@wait 10", "pow 5"], legacy_interval_ms=7)
+        new = compile_script(["wait 10", "expect-opcode 90 timeout=100"])
+        if old.dialect != "LEGACY" or old.interval_ms != 7 or new.dialect != "SCENARIO":
+            raise RuntimeError("Packaged script compatibility failed")
+        report["script_compatibility"] = True
+        report["shared_send_fields"] = all(app.wb_quick_vars[key] is getattr(app, f"raw_{key}_var")
+                                            for key in ("source", "destination", "opcode", "params"))
+        if not report["shared_send_fields"]:
+            raise RuntimeError("Packaged sending fields are not shared")
         app.log_file_var.set("")
         app.short_log_file_var.set("")
         app.update_idletasks()

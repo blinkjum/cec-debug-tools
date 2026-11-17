@@ -278,7 +278,8 @@ class WorkbenchGuiTests(unittest.TestCase):
                 g.update()
             g.update_idletasks()
             send.assert_not_called()
-        dialogs = [widget for widget in g.winfo_children() if isinstance(widget, self.module.tk.Toplevel)]
+        dialogs = [widget for widget in g.winfo_children() if isinstance(widget, self.module.tk.Toplevel)
+                   and hasattr(widget, "capture_detail_text")]
         self.assertEqual(len(dialogs), 1, "Native double click must open the detail window")
         dialog = dialogs[0]
         self.assertEqual(g.notebook.select(), str(g.capture_tab_widget))
@@ -333,9 +334,10 @@ class WorkbenchGuiTests(unittest.TestCase):
         g = self.gui
         self.frame([0x05, 0x90, 0])
         g.capture_tree.selection_set(g.capture_tree.get_children()[0])
+        windows_before = {str(widget) for widget in g.winfo_children() if isinstance(widget, self.module.tk.Toplevel)}
         with patch.object(g.capture_tree, "identify_row", return_value=""):
             self.assertIsNone(g._capture_show_details(SimpleNamespace(y=10000)))
-        self.assertFalse(any(isinstance(widget, self.module.tk.Toplevel) for widget in g.winfo_children()))
+        self.assertEqual(windows_before, {str(widget) for widget in g.winfo_children() if isinstance(widget, self.module.tk.Toplevel)})
 
     def test_highlight_panel_expands_hides_and_twelve_rules_match_live_frames(self):
         g = self.gui

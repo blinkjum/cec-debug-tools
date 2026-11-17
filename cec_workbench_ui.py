@@ -82,6 +82,8 @@ class CaptureWorkbenchMixin:
         self.wb_group_var = tk.StringVar(value="常用")
         self.wb_quick_vars = {name: tk.StringVar() for name in (
             "id", "name", "group", "source", "destination", "opcode", "params", "shortcut")}
+        for field in ("source", "destination", "opcode", "params"):
+            self.wb_quick_vars[field] = getattr(self, f"raw_{field}_var")
         self.wb_release_var = tk.BooleanVar(value=False)
         self.wb_quick_preview = tk.StringVar()
         self.wb_query = CaptureQuery()
@@ -369,7 +371,7 @@ class CaptureWorkbenchMixin:
         buttons.grid(row=5, column=0, columnspan=4, sticky="w", pady=4)
         ttk.Button(buttons, text="发送预览报文", command=self._wb_send_quick).pack(side="left")
         ttk.Button(buttons, text="保存命令", command=self._wb_save_quick).pack(side="left", padx=4)
-        ttk.Button(buttons, text="填入Raw", command=self._wb_to_raw).pack(side="left")
+        ttk.Button(buttons, text="手动发包…", command=self._wb_to_raw).pack(side="left")
         for var in self.wb_quick_vars.values():
             var.trace_add("write", lambda *_: self._wb_update_quick_preview())
         self.wb_release_var.trace_add("write", lambda *_: self._wb_update_quick_preview())

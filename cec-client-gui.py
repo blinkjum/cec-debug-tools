@@ -37,6 +37,8 @@ from capture_files_ui import CaptureFilesMixin
 from cec_capture_tools import write_export
 from capture_layout import CAPTURE_COLUMNS, CAPTURE_HEADINGS, MINIMUM_WIDTHS, PREFERRED_WIDTHS
 from capture_layout_ui import CaptureLayoutMixin
+from workspace_ui import WorkspaceUIMixin
+from cec_scripts import ScriptPlan, compile_script
 
 
 APP_NAME = "CEC Client GUI"
@@ -1089,7 +1091,7 @@ class AsyncLogWriter:
             close_event.set()
 
 
-class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin, tk.Tk):
+class CECClientGUI(WorkspaceUIMixin, CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin, tk.Tk):
     def __init__(self, *, read_settings: bool = True, start_hidden: bool = False) -> None:
         super().__init__()
         if start_hidden:
@@ -1165,6 +1167,8 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
             "read_rom": self.read_rom_var.get(),
             "log_file": self.log_file_var.get(),
             "short_log_file": self.short_log_file_var.get(),
+            "script_delay": self.script_delay_var.get(),
+            "script_dialect": self.script_dialect_var.get(),
             "sim_role": self.sim_role_var.get(),
             "sim_connect": self.sim_connect_var.get(),
             "occupancy_addresses": [la for la, var in enumerate(self.occupancy_la_vars) if var.get()],
@@ -1216,7 +1220,10 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         self.status_var = tk.StringVar(value="未连接")
         self.monitor_state_var = tk.StringVar(value="监听模式：未连接")
         self.command_args_var = tk.StringVar()
+        self.console_command_var = tk.StringVar()
         self.script_delay_var = tk.StringVar(value="0.2")
+        self.script_dialect_var = tk.StringVar(value="AUTO")
+        self._script_path_hint = ""
         self.device_filter_var = tk.StringVar()
         self.sim_role_var = tk.StringVar(value="x")
         self.sim_connect_var = tk.BooleanVar(value=False)
@@ -1317,6 +1324,8 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
             ("read_rom", self.read_rom_var),
             ("log_file", self.log_file_var),
             ("short_log_file", self.short_log_file_var),
+            ("script_delay", self.script_delay_var),
+            ("script_dialect", self.script_dialect_var),
             ("sim_role", self.sim_role_var),
             ("sim_connect", self.sim_connect_var),
             ("sim_source", self.sim_source_var),
@@ -1405,72 +1414,11 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         ttk.Label(connection_bar, textvariable=self.monitor_state_var, foreground="#555555").pack(side=LEFT, padx=(8, 0))
         ttk.Label(
             connection_bar,
-            text="所有页面共用同一个 libCEC 连接；角色模拟请在连接前勾选对应配置。",
+            text="共用连接；连接前配置角色。",
             foreground="#555555",
         ).pack(side=RIGHT, padx=(10, 0))
 
-        self.notebook = ttk.Notebook(outer)
-        self.notebook.pack(fill=BOTH, expand=True)
-
-        # The application used to expose every historical/debug page as a
-        # top-level tab.  Keep those capabilities, but group them by the
-        # tester's workflow so the main surface is smaller and easier to use.
-        cts_tab = ttk.Frame(self.notebook, padding=6)
-        session_tab = ttk.Frame(self.notebook, padding=6)
-        device_tab = ttk.Frame(self.notebook, padding=6)
-        capture_tab = ttk.Frame(self.notebook, padding=6)
-        advanced_tab = ttk.Frame(self.notebook, padding=6)
-        self.notebook.add(cts_tab, text="CEC CTS 测试")
-        self.notebook.add(session_tab, text="连接与拓扑")
-        self.notebook.add(device_tab, text="设备模拟与 Raw")
-        self.notebook.add(capture_tab, text="CEC 报文监视")
-        self.notebook.add(advanced_tab, text="高级工具")
-        self.advanced_tab_widget = advanced_tab
-        self.device_tab_widget = device_tab
-        self.capture_tab_widget = capture_tab
-
-        self.session_notebook = ttk.Notebook(session_tab)
-        self.session_notebook.pack(fill=BOTH, expand=True)
-        connection_page = ttk.Frame(self.session_notebook, padding=6)
-        topology_page = ttk.Frame(self.session_notebook, padding=6)
-        self.session_notebook.add(connection_page, text="连接与设备")
-        self.session_notebook.add(topology_page, text="拓扑预检")
-        self.topology_page = topology_page
-
-        self.device_notebook = ttk.Notebook(device_tab)
-        self.device_notebook.pack(fill=BOTH, expand=True)
-        simulation_page = ttk.Frame(self.device_notebook, padding=6)
-        raw_page = ttk.Frame(self.device_notebook, padding=6)
-        self.device_notebook.add(simulation_page, text="角色模拟")
-        self.device_notebook.add(raw_page, text="Raw CEC 注入")
-        occupancy_page = ttk.Frame(self.device_notebook, padding=6)
-        self.device_notebook.add(occupancy_page, text="逻辑地址占用/碰撞")
-
-        self.test_notebook = ttk.Notebook(cts_tab)
-        self.test_notebook.pack(fill=BOTH, expand=True)
-        cts_page = ttk.Frame(self.test_notebook, padding=6)
-        scenario_page = ttk.Frame(self.test_notebook, padding=6)
-        self.test_notebook.add(cts_page, text="CTS 项目")
-        self.test_notebook.add(scenario_page, text="自定义场景")
-
-        self.advanced_notebook = ttk.Notebook(advanced_tab)
-        self.advanced_notebook.pack(fill=BOTH, expand=True)
-        command_page = ttk.Frame(self.advanced_notebook, padding=6)
-        script_page = ttk.Frame(self.advanced_notebook, padding=6)
-        self.advanced_notebook.add(command_page, text="命令控制台")
-        self.advanced_notebook.add(script_page, text="脚本工具")
-        self.command_page = command_page
-
-        self._create_cts_tab(cts_page)
-        self._create_scenario_tab(scenario_page)
-        self._create_connection_tab(connection_page)
-        self._create_topology_tab(topology_page)
-        self._create_simulation_tab(simulation_page)
-        self._create_raw_tab(raw_page)
-        self._create_occupancy_tab(occupancy_page)
-        self._create_capture_tab(capture_tab)
-        self._create_command_tab(command_page)
-        self._create_script_tab(script_page)
+        self._workspace_create(outer)
 
         status = ttk.Frame(outer)
         status.pack(fill=X, pady=(6, 0))
@@ -1481,21 +1429,24 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
     def _create_menu(self) -> None:
         menu = tk.Menu(self)
         file_menu = tk.Menu(menu, tearoff=False)
-        file_menu.add_command(label="选择 libCEC cec.dll", command=self._browse_cec)
-        file_menu.add_command(label="保存当前输出", command=self._save_output)
+        file_menu.add_command(label="打开离线抓包…", command=self._workspace_open_capture)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self._on_close)
         menu.add_cascade(label="文件", menu=file_menu)
-
         tools_menu = tk.Menu(menu, tearoff=False)
-        tools_menu.add_command(label="列出适配器（libCEC API）", command=self._list_adapters)
-        tools_menu.add_command(label="显示 API 说明", command=self._show_cli_options)
-        tools_menu.add_command(label="显示 API 命令帮助", command=self._show_cli_help)
-        tools_menu.add_command(label="显示 libCEC 信息", command=self._show_info)
-        tools_menu.add_command(label="读取适配器统计", command=self._show_stats)
-        tools_menu.add_command(label="选择 OUI 厂商表…", command=self._browse_oui)
+        tools_menu.add_command(label="连接设置…", command=self._workspace_show_connection_settings)
+        tools_menu.add_command(label="原生日志…", command=self._workspace_show_diagnostics)
+        tools_menu.add_command(label="API 控制台…", command=self._open_advanced_command)
         tools_menu.add_separator()
-        tools_menu.add_command(label="清空输出", command=self._clear_output)
+        info = tk.Menu(tools_menu, tearoff=False)
+        for label, action in (("libCEC 编译信息", self._show_info), ("适配器统计", self._show_stats),
+                              ("API 命令帮助", self._show_cli_help), ("后端接口说明", self._show_cli_options)):
+            info.add_command(label=label, command=lambda run=action: self._workspace_diagnostic_action(run))
+        tools_menu.add_cascade(label="诊断信息", menu=info)
+        maintenance = tk.Menu(tools_menu, tearoff=False)
+        maintenance.add_command(label="进入 Bootloader…", command=lambda: self._workspace_diagnostic_action(self._bootloader))
+        tools_menu.add_cascade(label="固件维护", menu=maintenance)
+        tools_menu.add_command(label="选择 OUI 厂商表…", command=self._browse_oui)
         menu.add_cascade(label="工具", menu=tools_menu)
         self.config(menu=menu)
 
@@ -1533,7 +1484,7 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         self._refresh_capture_tree()
         self._append_output(f">>> 已加载 OUI 厂商表：{self.oui_lookup.path}（{len(self.oui_lookup.entries)} 条）\n")
 
-    def _create_connection_tab(self, parent: ttk.Frame) -> None:
+    def _create_connection_settings(self, parent: ttk.Frame) -> None:
         config = ttk.LabelFrame(parent, text="libCEC 原生连接参数", padding=8)
         config.pack(fill=X)
         config.columnconfigure(1, weight=1)
@@ -1576,31 +1527,10 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         ttk.Label(config, text="角色：p/r/t/a/x", foreground="#555555").grid(row=7, column=0, columnspan=2, sticky=W, padx=4, pady=3)
         ttk.Label(config, textvariable=self.oui_path_var, foreground="#555555").grid(row=7, column=2, columnspan=4, sticky=W, padx=4, pady=3)
 
-        buttons = ttk.Frame(parent)
-        buttons.pack(fill=X, pady=(8, 6))
-        ttk.Button(buttons, text="拓扑预检", command=lambda: self.session_notebook.select(self.topology_page)).pack(side=LEFT, padx=5)
-        ttk.Button(buttons, text="高级工具", command=self._open_advanced_command).pack(side=LEFT, padx=5)
-        ttk.Button(buttons, text="清空输出", command=self._clear_output).pack(side=RIGHT, padx=5)
-        ttk.Button(buttons, text="保存输出", command=self._save_output).pack(side=RIGHT, padx=5)
-
-        output_frame = ttk.LabelFrame(parent, text="libCEC 原生日志与报文输出", padding=5)
-        output_frame.pack(fill=BOTH, expand=True)
-        output_frame.rowconfigure(0, weight=1)
-        output_frame.columnconfigure(0, weight=1)
-        self.output = tk.Text(output_frame, wrap="none", undo=False, font=("Consolas", 10), background="#101418", foreground="#d7e3ea", insertbackground="white")
-        self.output.grid(row=0, column=0, sticky="nsew")
-        yscroll = ttk.Scrollbar(output_frame, orient="vertical", command=self.output.yview)
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll = ttk.Scrollbar(output_frame, orient="horizontal", command=self.output.xview)
-        xscroll.grid(row=1, column=0, sticky="ew")
-        self.output.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-
-        ttk.Label(parent, text="常用连接和设备状态集中在本页；命令控制台、脚本和 Bootloader 等高级功能请从“高级工具”进入。", foreground="#555555").pack(fill=X, pady=(6, 0))
-
     def _create_command_tab(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(1, weight=1)
         parent.columnconfigure(0, weight=1)
-        ttk.Label(parent, text="双击命令或选择后填写参数；所有命令也可以在下方直接输入。", foreground="#555555").grid(row=0, column=0, sticky=W, pady=(0, 6))
+        ttk.Label(parent, text="选择命令后补充参数，或直接输入完整 libCEC API 命令；执行结果显示在下方原生日志中。", foreground="#555555").grid(row=0, column=0, sticky=W, pady=(0, 6))
 
         frame = ttk.Frame(parent)
         frame.grid(row=1, column=0, sticky="nsew")
@@ -1623,34 +1553,13 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         bottom = ttk.Frame(parent)
         bottom.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         bottom.columnconfigure(1, weight=1)
-        ttk.Label(bottom, text="参数").grid(row=0, column=0, padx=(0, 5))
-        ttk.Entry(bottom, textvariable=self.command_args_var).grid(row=0, column=1, sticky="ew", padx=5)
-        ttk.Button(bottom, text="发送到当前会话", command=self._send_selected).grid(row=0, column=2, padx=3)
-        ttk.Button(bottom, text="单命令执行", command=self._run_selected_one_shot).grid(row=0, column=3, padx=3)
+        ttk.Label(bottom, text="完整命令").grid(row=0, column=0, padx=(0, 5))
+        self.console_entry = ttk.Entry(bottom, textvariable=self.console_command_var)
+        self.console_entry.grid(row=0, column=1, sticky="ew", padx=5)
+        self.console_entry.bind("<Return>", lambda _e: self._send_selected())
+        ttk.Button(bottom, text="执行命令", command=self._send_selected).grid(row=0, column=2, padx=3)
 
-    def _create_script_tab(self, parent: ttk.Frame) -> None:
-        parent.rowconfigure(1, weight=1)
-        parent.columnconfigure(0, weight=1)
-        ttk.Label(parent, text="每行一个 libCEC API 命令；空行和 # 注释会被忽略。支持 @wait 1000（毫秒）扩展。", foreground="#555555").grid(row=0, column=0, sticky=W, pady=(0, 6))
-        script_frame = ttk.Frame(parent)
-        script_frame.grid(row=1, column=0, sticky="nsew")
-        script_frame.rowconfigure(0, weight=1)
-        script_frame.columnconfigure(0, weight=1)
-        self.script_text = tk.Text(script_frame, wrap="none", font=("Consolas", 10))
-        self.script_text.grid(row=0, column=0, sticky="nsew")
-        yscroll = ttk.Scrollbar(script_frame, orient="vertical", command=self.script_text.yview)
-        yscroll.grid(row=0, column=1, sticky="ns")
-        self.script_text.configure(yscrollcommand=yscroll.set)
-        self.script_text.insert("1.0", "# 示例：扫描并查询 Audio System\nscan\n@wait 1000\npow 5\nname 5\nver 5\n")
 
-        controls = ttk.Frame(parent)
-        controls.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(controls, text="运行脚本", command=self._run_script).pack(side=LEFT, padx=(0, 5))
-        ttk.Button(controls, text="打开脚本", command=self._open_script).pack(side=LEFT, padx=5)
-        ttk.Button(controls, text="保存脚本", command=self._save_script).pack(side=LEFT, padx=5)
-        ttk.Label(controls, text="命令间隔(ms)").pack(side=LEFT, padx=(25, 4))
-        ttk.Entry(controls, textvariable=self.script_delay_var, width=8).pack(side=LEFT)
-        ttk.Button(controls, text="保存当前输出", command=self._save_output).pack(side=RIGHT)
 
     def _create_simulation_tab(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(3, weight=1)
@@ -1902,7 +1811,7 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
             wraplength=1100,
         ).grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
-        session = ttk.LabelFrame(parent, text="原始注入会话", padding=8)
+        session = ttk.LabelFrame(parent, text="发包选项", padding=8)
         session.grid(row=1, column=0, sticky="ew")
         ttk.Label(session, text="Raw 复用顶部的通用连接；监听状态请查看窗口顶部。", foreground="#555555").pack(side=LEFT, padx=(0, 12))
         ttk.Button(session, text="应用 LA", command=self._raw_apply_la).pack(side=LEFT, padx=5)
@@ -2064,17 +1973,25 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         parent.rowconfigure(1, weight=1)
         parent.rowconfigure(3, weight=1)
         parent.columnconfigure(0, weight=1)
-        ttk.Label(
-            parent,
-            text="每行一个步骤：普通 libCEC API 命令直接发送；wait 500；expect 50:72:01 timeout=1500；expect-opcode 72 timeout=1000。",
-            foreground="#555555",
-            wraplength=1100,
-        ).grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        intro = ttk.Frame(parent)
+        intro.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(intro, text="统一脚本：libCEC API 命令、wait / @wait 毫秒、expect、expect-opcode 和 assert；# 为注释。",
+                  foreground="#555555", wraplength=1080).pack(anchor=W)
+        pacing = ttk.Frame(intro)
+        pacing.pack(fill=X, pady=(4, 0))
+        ttk.Label(pacing, text="执行节奏").pack(side=LEFT)
+        RawValueCombobox(pacing, raw_variable=self.script_dialect_var,
+                         options=[("AUTO", "自动识别"), ("SCENARIO", "场景（命令间隔80ms）"), ("LEGACY", "旧命令脚本（自定间隔）")],
+                         width=29, state="readonly").pack(side=LEFT, padx=4)
+        ttk.Label(pacing, text="旧命令间隔(ms)").pack(side=LEFT, padx=(8, 3))
+        ttk.Entry(pacing, textvariable=self.script_delay_var, width=8).pack(side=LEFT)
+        ttk.Label(intro, text="纯命令旧文件可选 LEGACY；AUTO 无格式标记时按场景节奏。", foreground="#555555", wraplength=1080).pack(anchor=W, pady=(2, 0))
         scenario_frame = ttk.Frame(parent)
         scenario_frame.grid(row=1, column=0, sticky="nsew")
         scenario_frame.rowconfigure(0, weight=1)
         scenario_frame.columnconfigure(0, weight=1)
         self.scenario_text = tk.Text(scenario_frame, wrap="none", font=("Consolas", 10))
+        self.script_text = self.scenario_text
         self.scenario_text.grid(row=0, column=0, sticky="nsew")
         scenario_scroll = ttk.Scrollbar(scenario_frame, orient="vertical", command=self.scenario_text.yview)
         scenario_scroll.grid(row=0, column=1, sticky="ns")
@@ -2083,13 +2000,13 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
 
         controls = ttk.Frame(parent)
         controls.grid(row=2, column=0, sticky="ew", pady=(7, 6))
-        ttk.Button(controls, text="运行场景", command=self._run_scenario).pack(side=LEFT, padx=(0, 5))
-        ttk.Button(controls, text="停止场景", command=self._stop_scenario).pack(side=LEFT, padx=5)
+        ttk.Button(controls, text="运行脚本", command=self._run_scenario).pack(side=LEFT, padx=(0, 5))
+        ttk.Button(controls, text="停止脚本", command=self._stop_scenario).pack(side=LEFT, padx=5)
         ttk.Button(controls, text="打开", command=self._open_scenario).pack(side=LEFT, padx=5)
         ttk.Button(controls, text="保存", command=self._save_scenario).pack(side=LEFT, padx=5)
         ttk.Label(controls, textvariable=self.scenario_status_var).pack(side=RIGHT)
 
-        result_frame = ttk.LabelFrame(parent, text="场景结果", padding=5)
+        result_frame = ttk.LabelFrame(parent, text="脚本执行结果", padding=5)
         result_frame.grid(row=3, column=0, sticky="nsew")
         result_frame.rowconfigure(0, weight=1)
         result_frame.columnconfigure(0, weight=1)
@@ -2108,7 +2025,7 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         ttk.Button(toolbar, text="清空", command=self._clear_topology).pack(side=LEFT, padx=5)
         ttk.Button(toolbar, text="导出 CSV", command=self._export_topology_csv).pack(side=LEFT, padx=5)
         ttk.Button(toolbar, text="导出 JSON", command=self._export_topology_json).pack(side=LEFT, padx=5)
-        ttk.Label(toolbar, text="扫描使用当前 COM 端口", foreground="#555555").pack(side=RIGHT)
+        ttk.Label(toolbar, text="扫描使用当前设备连接", foreground="#555555").pack(side=RIGHT)
 
         frame = ttk.Frame(parent)
         frame.grid(row=1, column=0, sticky="nsew")
@@ -2769,8 +2686,7 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
             "<table><thead><tr><th>Case</th><th>章节</th><th>项目</th><th>执行方式</th><th>结果</th><th>CDF 决策/依据</th><th>证据/说明</th><th>流程与判定条件</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></body></html>"
 
     def _open_advanced_command(self) -> None:
-        self.notebook.select(self.advanced_tab_widget)
-        self.advanced_notebook.select(self.command_page)
+        self._workspace_show_diagnostics(console=True)
 
     def _bind_events(self) -> None:
         self._wb_bind()
@@ -2779,6 +2695,10 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         self.raw_opcode_var.trace_add("write", self._raw_opcode_changed)
         self.raw_opcode_combo.bind("<<ComboboxSelected>>", self._raw_opcode_changed, add="+")
         self._raw_opcode_changed()
+        for variable in (self.raw_source_var, self.raw_destination_var, self.raw_opcode_var, self.raw_params_var):
+            variable.trace_add("write", lambda *_: self._sync_raw_builder())
+        if not self.settings.get("raw_frame"):
+            self._sync_raw_builder()
 
     def _configure_backend_dll(self) -> None:
         value = self.cec_path_var.get().strip().strip('"')
@@ -3840,40 +3760,53 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         self.scenario_log.see(END)
         self.scenario_log.configure(state="disabled")
 
-    def _run_scenario(self) -> None:
+    def _run_scenario(self, *, dialect: str | None = None) -> None:
         self._files_show_live()
         if self.scenario_running:
-            messagebox.showinfo(APP_NAME, "场景已经在运行。")
+            messagebox.showinfo(APP_NAME, "脚本已经在运行。")
+            return
+        if self.cts_running or self.raw_send_busy or self._wb_quick_busy:
+            messagebox.showinfo(APP_NAME, "请等待当前测试或发送结束，再运行脚本。")
             return
         if not self.backend.is_open:
-            messagebox.showwarning(APP_NAME, "请先在窗口顶部连接设备，再运行场景。")
+            messagebox.showwarning(APP_NAME, "请先在窗口顶部连接设备，再运行脚本。")
             return
         lines = self.scenario_text.get("1.0", END).splitlines()
+        try:
+            plan = compile_script(lines, dialect or self.script_dialect_var.get(), self.script_delay_var.get(), self._script_path_hint)
+        except ValueError as exc:
+            messagebox.showwarning(APP_NAME, str(exc))
+            return
+        if not plan.steps:
+            self.scenario_status_var.set("脚本没有可执行步骤")
+            return
         self.scenario_log.configure(state="normal")
         self.scenario_log.delete("1.0", END)
         self.scenario_log.configure(state="disabled")
         self.scenario_stop_event.clear()
         self.scenario_running = True
-        self.scenario_status_var.set("运行中")
-        threading.Thread(target=self._scenario_thread, args=(lines,), daemon=True).start()
+        self.scenario_status_var.set(f"运行中：{plan.dialect}，命令间隔 {plan.interval_ms:g} ms")
+        threading.Thread(target=self._scenario_thread, args=(plan,), daemon=True).start()
 
     def _stop_scenario(self) -> None:
         self.scenario_stop_event.set()
         if self.scenario_running:
             self.scenario_status_var.set("正在停止")
 
-    def _scenario_thread(self, lines: list[str]) -> None:
+    def _scenario_thread(self, lines: list[str] | ScriptPlan) -> None:
         cursor = len(self.capture_records)
         passed = 0
         failed = 0
-        self.output_queue.put(("scenario_log", f"开始场景，起始抓包序号：{cursor + 1}"))
+        sent = 0
         try:
-            for line_number, raw_line in enumerate(lines, start=1):
+            plan = lines if isinstance(lines, ScriptPlan) else compile_script(lines, "SCENARIO")
+            self.output_queue.put(("scenario_log", f"开始脚本：{plan.dialect}，命令间隔 {plan.interval_ms:g} ms，起始抓包序号：{cursor + 1}"))
+            for step in plan.steps:
+                line_number = step.line_number
                 if self.scenario_stop_event.is_set():
                     raise RuntimeError("用户停止")
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
+                kind = "wait" if step.kind == "@wait" else step.kind
+                line = step.value if kind == "command" else f"{kind} {step.value}"
                 lower = line.lower()
                 if lower.startswith("wait "):
                     milliseconds = float(line.split(maxsplit=1)[1])
@@ -3909,9 +3842,11 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
                     continue
                 self.output_queue.put(("scenario_command", line))
                 self.output_queue.put(("scenario_log", f"[{line_number}] 发送：{line}"))
-                time.sleep(0.08)
-            self.output_queue.put(("scenario_log", f"场景通过：{passed} 个检查，失败：{failed}"))
-            self.output_queue.put(("scenario_status", f"通过（{passed} 项）"))
+                sent += 1
+                if self.scenario_stop_event.wait(plan.interval_ms / 1000.0):
+                    raise RuntimeError("用户停止")
+            self.output_queue.put(("scenario_log", f"脚本完成：{sent} 条命令，{passed} 个检查，失败：{failed}"))
+            self.output_queue.put(("scenario_status", f"完成（{sent} 条命令，{passed} 项检查）"))
         except Exception as exc:  # scenario errors should become test results, not crash the GUI
             self.output_queue.put(("scenario_log", f"场景失败：{exc}"))
             self.output_queue.put(("scenario_status", f"失败（通过 {passed}，失败 {failed + 1}）"))
@@ -3971,20 +3906,22 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
             return False
         return False
 
-    def _open_scenario(self) -> None:
-        path = filedialog.askopenfilename(title="打开 CEC 场景", filetypes=[("CEC 场景", "*.cec;*.txt"), ("所有文件", "*.*")])
+    def _open_scenario(self, *, dialect="AUTO") -> None:
+        path = filedialog.askopenfilename(title="打开 CEC 脚本", filetypes=[("CEC 脚本", "*.cec;*.txt;*.cmd"), ("所有文件", "*.*")])
         if not path:
             return
         try:
-            text = Path(path).read_text(encoding="utf-8")
+            text = Path(path).read_text(encoding="utf-8-sig")
         except (OSError, UnicodeError) as exc:
             messagebox.showerror(APP_NAME, f"读取场景失败：\n{exc}")
             return
         self.scenario_text.delete("1.0", END)
         self.scenario_text.insert("1.0", text)
+        self._script_path_hint = str(path)
+        self.script_dialect_var.set(dialect)
 
     def _save_scenario(self) -> None:
-        path = filedialog.asksaveasfilename(title="保存 CEC 场景", defaultextension=".cec", filetypes=[("CEC 场景", "*.cec"), ("文本文件", "*.txt"), ("所有文件", "*.*")])
+        path = filedialog.asksaveasfilename(title="保存 CEC 脚本", defaultextension=".cec", filetypes=[("CEC 脚本", "*.cec"), ("文本文件", "*.txt"), ("旧命令文件", "*.cmd"), ("所有文件", "*.*")])
         if not path:
             return
         try:
@@ -4568,6 +4505,21 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         """Compatibility wrapper for older callers; monitoring is global now."""
         self._set_monitoring(enabled)
 
+    def _sync_raw_builder(self) -> None:
+        """Shared field edits update the preview; direct raw text remains editable."""
+        try:
+            source = self._parse_la(self.raw_source_var.get())
+            destination = self._parse_la(self.raw_destination_var.get())
+            frame = [(source << 4) | destination]
+            if self.raw_opcode_var.get().strip():
+                frame.extend([self._parse_byte(self.raw_opcode_var.get()), *self._parse_byte_list(self.raw_params_var.get())])
+            elif self.raw_params_var.get().strip():
+                return
+            if len(frame) <= 16:
+                self.raw_frame_var.set(self._format_frame(frame))
+        except (ValueError, tk.TclError):
+            pass
+
     def _raw_build_frame(self) -> None:
         try:
             source = self._parse_la(self.raw_source_var.get())
@@ -4715,7 +4667,7 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         if not command:
             return False
         if not self.backend.is_open:
-            messagebox.showwarning(APP_NAME, "请先在窗口顶部连接设备；单命令执行仍可独立运行。")
+            messagebox.showwarning(APP_NAME, "请先在窗口顶部连接设备。")
             return False
         result = self.backend.execute_command(command)
         self._add_history(command)
@@ -4741,6 +4693,8 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         if not selection:
             return
         self.command_args_var.set("")
+        values = self.command_tree.item(selection[0], "values")
+        self.console_command_var.set(str(values[0]))
 
     def _selected_command(self) -> str:
         selection = self.command_tree.selection()
@@ -4752,10 +4706,8 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
         return f"{command} {args}".strip()
 
     def _send_selected(self) -> None:
-        command = self._selected_command()
-        if self._command_needs_confirmation(command) and not messagebox.askyesno(APP_NAME, f"命令 {command} 可能改变设备或适配器状态，确定发送？"):
-            return
-        self._send_command(command)
+        command = self.console_command_var.get().strip() or self._selected_command()
+        self._run_one_shot_command(command)
 
     def _run_selected_one_shot(self) -> None:
         self._run_one_shot_command(self._selected_command())
@@ -4768,46 +4720,15 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
             return
         if self.oneshot_busy:
             return
-        if not self.backend.is_open:
-            messagebox.showwarning(APP_NAME, "请先在窗口顶部连接设备，再执行单命令。")
-            return
-        result = self.backend.execute_command(command)
-        self._append_output(f"\n>>> libCEC API 单命令：{command}\n{result.text}\n")
+        self._send_command(command)
 
     def _run_script(self) -> None:
-        if not self.backend.is_open:
-            messagebox.showwarning(APP_NAME, "请先在窗口顶部连接设备，再运行脚本。")
-            return
-        lines = self.script_text.get("1.0", END).splitlines()
-        commands: list[tuple[str, str]] = []
-        for line in lines:
-            value = line.strip()
-            if not value or value.startswith("#"):
-                continue
-            if value.lower().startswith("@wait"):
-                try:
-                    commands.append(("wait", str(float(value.split(maxsplit=1)[1]))))
-                except (IndexError, ValueError):
-                    messagebox.showwarning(APP_NAME, f"无法解析等待命令：{value}")
-                    return
-            else:
-                commands.append(("command", value))
-        try:
-            delay = max(0.0, float(self.script_delay_var.get()) / 1000.0)
-        except ValueError:
-            messagebox.showwarning(APP_NAME, "命令间隔必须是数字。")
-            return
-        threading.Thread(target=self._script_thread, args=(commands, delay), daemon=True).start()
+        """Legacy entry point; the single editor uses legacy command pacing."""
+        self._run_scenario(dialect="LEGACY")
 
     def _script_thread(self, commands: list[tuple[str, str]], delay: float) -> None:
-        for kind, value in commands:
-            if not self.backend.is_open:
-                break
-            if kind == "wait":
-                time.sleep(float(value) / 1000.0)
-                continue
-            self.output_queue.put(("script_command", value))
-            time.sleep(delay)
+        lines = [f"@wait {value}" if kind == "wait" else value for kind, value in commands]
+        self._scenario_thread(compile_script(lines, "LEGACY", delay * 1000.0))
 
     def _stop_session(self) -> None:
         if not self.backend.is_open:
@@ -4896,25 +4817,10 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
             variable.set(path)
 
     def _open_script(self) -> None:
-        path = filedialog.askopenfilename(title="打开 CEC 脚本", filetypes=[("文本文件", "*.txt;*.cec;*.cmd"), ("所有文件", "*.*")])
-        if not path:
-            return
-        try:
-            text = Path(path).read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
-            messagebox.showerror(APP_NAME, f"读取脚本失败：\n{exc}")
-            return
-        self.script_text.delete("1.0", END)
-        self.script_text.insert("1.0", text)
+        self._open_scenario(dialect="LEGACY")
 
     def _save_script(self) -> None:
-        path = filedialog.asksaveasfilename(title="保存 CEC 脚本", defaultextension=".cec", filetypes=[("CEC 脚本", "*.cec"), ("文本文件", "*.txt"), ("所有文件", "*.*")])
-        if not path:
-            return
-        try:
-            Path(path).write_text(self.script_text.get("1.0", END), encoding="utf-8")
-        except OSError as exc:
-            messagebox.showerror(APP_NAME, f"保存脚本失败：\n{exc}")
+        self._save_scenario()
 
     def _save_output(self) -> None:
         path = filedialog.asksaveasfilename(title="保存 libCEC 输出", defaultextension=".txt", filetypes=[("文本文件", "*.txt"), ("日志文件", "*.log"), ("所有文件", "*.*")])
@@ -4946,12 +4852,14 @@ class CECClientGUI(CaptureLayoutMixin, CaptureFilesMixin, CaptureWorkbenchMixin,
             except OSError:
                 pass
         self.backend.close()
+        self.scenario_stop_event.set()
         self._save_settings()
         self.log_writer.close()
         self.destroy()
 
     def destroy(self) -> None:
         self._closing = True
+        self.scenario_stop_event.set()
         for name in ("_layout_save_job", "_wb_chips_job"):
             job = getattr(self, name, None)
             if job is not None:
