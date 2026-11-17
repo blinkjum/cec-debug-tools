@@ -25,6 +25,12 @@ def record(seq=1, **overrides):
 
 
 class WorkbenchModelTests(unittest.TestCase):
+    def test_empty_conditions_and_normalized_summary(self):
+        self.assertFalse(CaptureQuery.from_dict({"source": "*", "opcode": "*", "params": "*", "status": "ALL", "text": "  "}).has_conditions)
+        query = CaptureQuery.from_dict({"source": "5,0", "opcode": "90,POLL", "params": "a?:??", "bookmarks_only": True})
+        self.assertTrue(query.has_conditions)
+        self.assertEqual(query.describe(), "源LA=0,5；Opcode=90,POLL；参数=A?:??；仅书签")
+
     def test_highlight_migration_custom_colors_and_invalid_saved_rules(self):
         migrated = highlight_settings({"capture_highlight_opcodes": ["72", "C2", "90", "C1"]})
         self.assertEqual(len(migrated), 12)
@@ -108,6 +114,146 @@ class WorkbenchGuiTests(unittest.TestCase):
 
     def selected_sequence(self):
         return self.gui._capture_selected_sequence()
+
+    def test_empty_query_disables_navigation_and_does_not_select_all_frames(self):
+        g = self.gui
+        self.frame([0x05, 0x90, 0])
+        self.frame([0x50, 0x7A, 0x20], 2)
+        self.assertEqual(g.wb_mode_var.get(), "FIND")
+        self.assertEqual(g._wb_matches, [])
+        g._wb_navigate(1)
+        self.assertIsNone(self.selected_sequence())
+        self.assertTrue(g.wb_next_button.instate(["disabled"]))
+        self.assertTrue(g.wb_previous_button.instate(["disabled"]))
+        self.assertIn("未设置", g.wb_search_status.get())
+        g.wb_query_vars["opcode"].set("*")
+        g._wb_navigate(-1)
+        self.assertEqual(g._wb_matches, [])
+        self.assertIsNone(self.selected_sequence())
+
+    def test_find_preserves_context_and_row_ids_with_optional_filter(self):
+        g = self.gui
+        for i, frame in enumerate(([0x05, 0x8F], [0x50, 0x90, 0], [0x05, 0x44, 0x41], [0x50, 0x90, 1]), 1):
+            self.frame(frame, i)
+        children = g.capture_tree.get_children()
+        g.wb_query_vars["opcode"].set("90")
+        with patch.object(g.capture_tree, "delete") as delete:
+            g._wb_apply_query()
+            g._wb_navigate(1)
+            g._wb_navigate(1)
+            delete.assert_not_called()
+        self.assertEqual(g.capture_tree.get_children(), children)
+        self.assertEqual(self.selected_sequence(), 4)
+        self.assertEqual(g._wb_matches, [2, 4])
+        self.assertIn("Opcode=90", g.wb_search_summary.get())
+        self.assertIn("第 2 / 2", g.wb_search_status.get())
+        g.wb_only_matches_button.invoke()
+        self.assertEqual(g._wb_applied_mode, "FILTER")
+        self.assertEqual([g.capture_tree.item(item, "values")[0] for item in g.capture_tree.get_children()], [2, 4])
+        g.wb_only_matches_button.invoke()
+        self.assertEqual(g._wb_applied_mode, "FIND")
+        self.assertEqual(len(g.capture_tree.get_children()), 4)
+        self.assertEqual(self.selected_sequence(), 4)
+        g._wb_clear_query()
+        self.assertFalse(g.wb_only_matches_var.get())
+        self.assertTrue(g.wb_next_button.instate(["disabled"]))
+
+    def test_query_fields_auto_apply_and_invalid_draft_disables_navigation(self):
+        g = self.gui
+        self.frame([0x05, 0x90, 0])
+        self.frame([0x50, 0x7A, 0x20], 2)
+        g.wb_query_vars["opcode"].set("90")
+        g.after(260, g.quit)
+        g.mainloop()
+        self.assertEqual(g._wb_matches, [1])
+        self.assertFalse(g.wb_next_button.instate(["disabled"]))
+        g.wb_query_vars["opcode"].set("GG")
+        self.assertFalse(g._wb_apply_query())
+        g._wb_navigate(1)
+        self.assertIsNone(self.selected_sequence())
+        self.assertTrue(g.wb_next_button.instate(["disabled"]))
+        self.frame([0x05, 0x90, 1], 3)
+        self.assertEqual(g._wb_matches, [1, 3])
+        self.assertEqual(len(g.capture_tree.get_children()), 3)
+        g.wb_query_vars["opcode"].set("7A")
+        g._wb_apply_query()
+        self.assertEqual(g._wb_matches, [2])
+        self.assertFalse(g.wb_next_button.instate(["disabled"]))
+
+    def test_same_opcode_action_uses_right_clicked_row_in_multi_selection(self):
+        g = self.gui
+        self.frame([0x05, 0x44, 0x41])
+        self.frame([0x50, 0x90, 1], 2)
+        first, second = g.capture_tree.get_children()
+        g.capture_tree.selection_set((first, second))
+        pointer = SimpleNamespace(x=10, y=5, x_root=10, y_root=10)
+        with patch.object(g.capture_tree, "identify_row", return_value=second), patch.object(self.module.tk.Menu, "tk_popup"):
+            g._capture_context_menu(pointer)
+        menu, action = next((widget, i) for widget in g.winfo_children() if isinstance(widget, self.module.tk.Menu)
+                            and widget.index("end") is not None for i in range(widget.index("end") + 1)
+                            if widget.type(i) == "command" and widget.entrycget(i, "label") == "查找相同 Opcode")
+        with patch.object(g.backend, "transmit") as transmit:
+            menu.invoke(action)
+            transmit.assert_not_called()
+        self.assertEqual(g.wb_query_vars["opcode"].get(), "90")
+        self.assertEqual(self.selected_sequence(), 2)
+        self.assertEqual(len(g.capture_tree.get_children()), 2)
+        self.assertEqual(g._wb_matches, [2])
+        self.frame([0x05], 3)
+        g._wb_find_same_opcode(g.capture_records[-1])
+        self.assertTrue(g.capture_show_poll_var.get())
+        self.assertEqual(g._wb_matches, [3])
+
+    def test_navigation_centers_hit_and_holds_view_until_explicit_scroll_or_latest(self):
+        g = self.gui
+        g.geometry("1280x860")
+        g.notebook.select(g.capture_tab_widget)
+        g.deiconify()
+        for i in range(70):
+            self.frame([0x05, 0x90 if i == 35 else 0x8F, 0] if i == 35 else [0x05, 0x8F], i)
+        g.update()
+        g.wb_query_vars["opcode"].set("90")
+        g._wb_navigate(1)
+        g.update_idletasks()
+        canvas = g.capture_tree.body_canvas
+        row = g.capture_tree._order.index(g.capture_tree.selection()[0])
+        top, bottom = g.capture_tree._row_offsets[row:row+2]
+        self.assertLess(abs((top+bottom)/2 - canvas.canvasy(0) - canvas.winfo_height()/2), 5)
+        self.assertTrue(g._capture_follow_suspended)
+        before = g.capture_tree.yview()[0] * g.capture_tree._row_offsets[-1]
+        for i in range(10):
+            self.frame([0x50, 0x90, 0], 100+i)
+        after = g.capture_tree.yview()[0] * g.capture_tree._row_offsets[-1]
+        self.assertAlmostEqual(before, after, delta=2)
+        self.assertEqual(self.selected_sequence(), 36)
+        g._wb_jump(80)
+        self.assertTrue(g.capture_tree.is_at_bottom())
+        with patch.object(g.capture_tree, "see_end") as follow:
+            self.frame([0x50, 0x90, 0], 200)
+            follow.assert_not_called()
+        g._capture_user_yview("moveto", 1)
+        self.assertFalse(g._capture_follow_suspended)
+        self.frame([0x50, 0x90, 0], 201)
+        self.assertTrue(g.capture_tree.is_at_bottom())
+        g._wb_jump(36)
+        g._wb_latest()
+        self.assertFalse(g._capture_follow_suspended)
+        self.assertTrue(g.capture_tree.is_at_bottom())
+        self.assertEqual(g.gui_error_count, 0)
+
+    def test_jump_restores_context_around_pinned_old_selection(self):
+        g = self.gui
+        g.capture_display_limit = 20
+        for i in range(60):
+            self.frame([0x05, 0x90, 0], i)
+        g._wb_jump(5)
+        g._refresh_capture_tree(force=True)
+        self.assertNotIn(6, [g.capture_tree.item(item, "values")[0] for item in g.capture_tree.get_children()])
+        g._wb_jump(5)
+        visible = [g.capture_tree.item(item, "values")[0] for item in g.capture_tree.get_children()]
+        self.assertEqual(visible, list(range(1, 21)))
+        self.assertEqual(self.selected_sequence(), 5)
+
 
     def test_double_click_opens_read_only_details_without_leaving_monitor(self):
         g = self.gui
@@ -286,6 +432,7 @@ class WorkbenchGuiTests(unittest.TestCase):
         self.frame([0x05, 0x90, 0x02], 3, ack=1)
         for name, value in {"source": "0", "destination": "5", "opcode": "90", "params": "0?", "status": "ACK"}.items():
             g.wb_query_vars[name].set(value)
+        g.wb_mode_var.set("FILTER")
         self.assertTrue(g._wb_apply_query())
         self.assertEqual(g._wb_matches, [1])
         self.assertEqual(len(g.capture_tree.get_children()), 1)
@@ -307,6 +454,7 @@ class WorkbenchGuiTests(unittest.TestCase):
             self.frame([0x05, 0x90, 0x00], index)
         g.capture_tree.end_update()
         self.assertEqual(len(g.capture_tree.get_children()), 2000)
+        g.wb_query_vars["opcode"].set("90")
         g._wb_navigate(1)
         self.assertEqual(self.selected_sequence(), 1)
         g._wb_navigate(1)
@@ -417,6 +565,7 @@ class WorkbenchGuiTests(unittest.TestCase):
         self.frame([0x50, 0x7A, 0x20], 2)
         g.capture_paused_var.set(True)
         g.wb_query_vars["source"].set("5")
+        g.wb_mode_var.set("FILTER")
         with patch("cec_workbench_ui.simpledialog.askstring", return_value="AMP回复"):
             g._wb_save_filter()
         self.assertEqual(len(g.capture_tree.get_children()), 1)

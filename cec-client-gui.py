@@ -33,6 +33,8 @@ from cts_testcases import CASE_BY_ID, CASES, AUTO, CONDITIONAL, EXTERNAL, MANUAL
 from runtime_paths import application_directory
 from cec_workbench_ui import CaptureWorkbenchMixin, LA_CHOICES
 from cec_workbench import HIGHLIGHT_PALETTE, HIGHLIGHT_RULE_COUNT
+from capture_files_ui import CaptureFilesMixin
+from cec_capture_tools import write_export
 
 
 APP_NAME = "CEC Client GUI"
@@ -601,15 +603,16 @@ class CaptureTable(ttk.Frame):
         self.body_canvas.yview_moveto(1.0)
         self._request_render()
 
-    def see(self, item: str) -> None:
+    def see(self, item: str, *, center: bool = False) -> None:
         if item not in self._items:
             return
         index = self._order.index(item)
         top, bottom = self._row_offsets[index:index + 2]
         view_top = self.body_canvas.canvasy(0)
         height = max(1, self.body_canvas.winfo_height())
-        if top < view_top or bottom > view_top + height:
-            self.body_canvas.yview_moveto(max(0, top - height // 3) / max(1, self._row_offsets[-1]))
+        if center or top < view_top or bottom > view_top + height:
+            target = top - max(0, (height - (bottom - top)) // 2) if center else top - height // 3
+            self.body_canvas.yview_moveto(max(0, target) / max(1, self._row_offsets[-1]))
         self._request_render()
 
     def heading(self, column: str, option: str | None = None, **kwargs: object):  # type: ignore[no-untyped-def]
@@ -732,18 +735,32 @@ class CaptureTable(ttk.Frame):
     def _on_left_click(self, event: tk.Event) -> None:
         item = self.identify_row(event.y)
         if item:
-            self.selection_set(item)
+            anchor = getattr(self, "_selection_anchor", None)
+            if event.state & 0x0001 and anchor in self._items:
+                first, last = sorted((self._order.index(anchor), self._order.index(item)))
+                self.selection_set(tuple(self._order[first:last + 1]))
+            elif event.state & 0x0004:
+                selected = set(self._selection)
+                selected.remove(item) if item in selected else selected.add(item)
+                self.selection_set(tuple(value for value in self._order if value in selected))
+                self._selection_anchor = item
+            else:
+                self.selection_set(item)
+                self._selection_anchor = item
             self.focus(item)
 
     def _scroll_rows(self, units: int) -> str:
         self.body_canvas.yview_scroll(units, "units")
+        callback = getattr(self, "on_user_scroll", None)
+        if callback:
+            callback()
         return "break"
 
     def _on_mousewheel(self, event: tk.Event) -> str:
         delta = int(getattr(event, "delta", 0))
         if delta:
             units = -max(1, abs(delta) // 120) if delta > 0 else max(1, abs(delta) // 120)
-            self.body_canvas.yview_scroll(units, "units")
+            self._scroll_rows(units)
         return "break"
 
     def _on_shift_mousewheel(self, event: tk.Event) -> str:
@@ -881,6 +898,8 @@ class CaptureTable(ttk.Frame):
                 cell_background = str(highlight_style.get("background", "#FFE68A"))
                 cell_foreground = str(highlight_style.get("foreground", "#202020"))
                 cell_outline = str(highlight_style.get("outline", "#666666"))
+            if not selected and column == "mark" and "capture_length_error" in tags:
+                cell_background, cell_foreground, cell_outline = "#F8B4B4", "#8B0000", "#CC5555"
             self.body_canvas.create_rectangle(
                 offset, y0, offset + width, y1,
                 fill=cell_background, outline=cell_outline, tags=canvas_tags,
@@ -908,7 +927,7 @@ class AsyncLogWriter:
         self._queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._error_callback = error_callback
         self._closed = False
-        self._thread = threading.Thread(target=self._run, name="cec-log-writer", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="cec-log-writer", daemon=False)
         self._thread.start()
 
     def write(self, path_text: str, text: str) -> None:
@@ -928,6 +947,12 @@ class AsyncLogWriter:
         completed = threading.Event()
         self._queue.put(("flush", completed))
         return completed.wait(timeout) if wait else True
+
+    def capture_export(self, path, records, kind, fields, callback) -> None:
+        if not self._closed:
+            self._queue.put(("capture_export", (path, records, kind, fields, callback)))
+        else:
+            callback("文件写入队列已关闭")
 
     def close(self, timeout: float = 3.0) -> None:
         if self._closed:
@@ -990,6 +1015,13 @@ class AsyncLogWriter:
                             temporary.unlink(missing_ok=True)
                         except OSError:
                             pass
+                elif command == "capture_export":
+                    path, records, kind, fields, callback = payload
+                    try:
+                        write_export(path, records, kind, fields)
+                        callback(None)
+                    except Exception as exc:
+                        callback(str(exc))
                 elif command == "flush":
                     flush_events.append(payload)  # type: ignore[arg-type]
                 elif command == "close":
@@ -1017,7 +1049,7 @@ class AsyncLogWriter:
             close_event.set()
 
 
-class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
+class CECClientGUI(CaptureFilesMixin, CaptureWorkbenchMixin, tk.Tk):
     def __init__(self, *, read_settings: bool = True, start_hidden: bool = False) -> None:
         super().__init__()
         if start_hidden:
@@ -1984,7 +2016,9 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
             self.capture_tree.tag_configure(f"capture_source_{source:X}", background=background, foreground="#263238")
         self.capture_tree.tag_configure("capture_source_unknown", background="#F5F5F5", foreground="#37474F")
         self._wb_apply_highlight_styles()
-        yscroll = ttk.Scrollbar(frame, orient="vertical", command=self.capture_tree.yview)
+        self.capture_tree.tag_configure("capture_length_error")
+        self.capture_tree.on_user_scroll = self._capture_user_scrolled
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=self._capture_user_yview)
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll = ttk.Scrollbar(frame, orient="horizontal", command=self.capture_tree.xview)
         xscroll.grid(row=1, column=0, sticky="ew")
@@ -1992,6 +2026,7 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
         self.capture_tree.bind("<Double-1>", self._capture_show_details)
         self.capture_tree.bind("<Button-3>", self._capture_context_menu, add="+")
         self.capture_tree.bind("<Control-c>", self._copy_capture_current_row, add="+")
+        self.capture_tree.bind("<Control-a>", self._capture_select_all, add="+")
 
     def _reset_capture_columns(self) -> None:
         preferred = {
@@ -2340,6 +2375,7 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
             self._cts_show_case(self.cts_result_tree.item(selection[0], "values")[0])
 
     def _cts_run_selected(self) -> None:
+        self._files_show_live()
         if self._wb_quick_busy:
             self.status_var.set("请等待快捷命令发送结束，再运行 CTS")
             return
@@ -3092,11 +3128,13 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
         status: str,
         raw_timestamp_ms: int | None = None,
     ) -> None:
+        live = self._files_live if self._files_mode == "OFFLINE" else None
+        records = live["records"] if live else self.capture_records
         source = (frame[0] >> 4) & 0x0F
         destination = frame[0] & 0x0F
         opcode = frame[1] if len(frame) > 1 else None
         theoretical_duration_ms = self._capture_theoretical_duration_ms(frame)
-        previous_record = self.capture_records[-1] if self.capture_records else None
+        previous_record = records[-1] if records else None
         callback_interval_ms: float | None = None
         estimated_gap_ms: float | None = None
         if previous_record is not None and isinstance(raw_timestamp_ms, (int, float)):
@@ -3108,7 +3146,7 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
                 # not a physical CEC line idle-time measurement.
                 estimated_gap_ms = round(callback_interval_ms - theoretical_duration_ms, 1)
         record = {
-            "seq": len(self.capture_records) + 1,
+            "seq": len(records) + 1,
             "time": self._format_capture_time(raw_timestamp_ms),
             "timestamp_ms": raw_timestamp_ms,
             "direction": direction,
@@ -3126,13 +3164,18 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
             "params_explanation": self._decode_opcode_parameters(opcode, frame[2:]),
             "status": status,
         }
-        self.capture_records.append(record)
-        self._wb_on_record(record)
+        records.append(record)
+        if live:
+            live["map"][record["seq"]] = record
+            self._files_record_added(record, live)
+        else:
+            self._wb_on_record(record)
         self.capture_last_frame_at = time.monotonic()
         if direction == "TX":
             self.capture_last_tx = record
         try:
-            self._append_capture_record_to_tree(record)
+            if not live:
+                self._append_capture_record_to_tree(record)
         except Exception as exc:
             self._capture_display_dirty = True
             self._report_ui_error("报文表格增量更新", exc)
@@ -3194,8 +3237,16 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
 
     def _update_capture_refresh_state(self) -> None:
         self._wb_update_search_status()
+        self._files_update_summary()
+        if self._files_mode == "OFFLINE":
+            self.capture_refresh_state_var.set(
+                f"离线查看：{self._files_path.name if self._files_path else '已载入文件'}；本文件 {len(self.capture_records)} 条；"
+                f"后台实时记录 {len(self._files_live['records']) if self._files_live else 0} 条；! 表示非法数据块")
+            return
         if self.capture_paused_var.get():
             mode = "显示已暂停（仍在记录）"
+        elif self._capture_follow_suspended:
+            mode = "浏览定位（返回最新或滚到底部恢复跟随）"
         elif self.capture_tree.is_at_bottom():
             mode = "跟随最新"
         else:
@@ -3308,6 +3359,8 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
         source = str(record.get("source", "")).strip().upper()
         row_tag = f"capture_source_{source}" if source in "0123456789ABCDEF" else "capture_source_unknown"
         tags = [row_tag]
+        if record.get("length_status") == "ERROR":
+            tags.append("capture_length_error")
         highlight_tag = self._capture_highlight_tag(record.get("opcode"))
         if highlight_tag:
             tags.append(highlight_tag)
@@ -3329,6 +3382,7 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
         visible_count = len(self.capture_tree.get_children()) if hasattr(self, "capture_tree") else 0
         self.capture_summary_var.set(
             f"当前显示 {visible_count} 条：TX {self.capture_visible_tx_count} / RX {self.capture_visible_rx_count}"
+            + ("（仅非法数据块）" if self._files_errors_only.get() else "")
         )
 
     def _append_capture_record_to_tree(self, record: dict) -> None:
@@ -3337,7 +3391,7 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
             return
         if not self._capture_record_matches_filter(record):
             return
-        follow_tail = self.capture_tree.is_at_bottom()
+        follow_tail = self.capture_tree.is_at_bottom() and not self._capture_follow_suspended
         values, tags = self._capture_record_values_and_tags(record)
         self.capture_tree.insert("", END, values=values, tags=tags)
         direction = str(record.get("direction", ""))
@@ -3365,7 +3419,8 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
         if not hasattr(self, "capture_tree") or (self.capture_paused_var.get() and not force):
             return
         selected_sequence = self._capture_selected_sequence()
-        follow_tail = self.capture_tree.is_at_bottom()
+        selected_sequences = [int(self.capture_tree.item(item, "values")[0]) for item in self.capture_tree.selection()]
+        follow_tail = self.capture_tree.is_at_bottom() and not self._capture_follow_suspended
         previous_view = self.capture_tree.yview()
         self.capture_tree.begin_update()
         try:
@@ -3375,10 +3430,12 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
             sequence_items: dict[int, str] = {}
             candidates = [record for record in self.capture_records if self._capture_record_matches_filter(record)]
             visible = candidates[-self.capture_display_limit:]
-            selected_record = self._wb_records.get(selected_sequence)
-            if (selected_record is not None and self._capture_record_matches_filter(selected_record)
-                    and selected_record not in visible):
-                visible = [selected_record, *visible[-(self.capture_display_limit - 1):]]
+            pinned = [self._wb_records[seq] for seq in selected_sequences if seq in self._wb_records
+                      and self._capture_record_matches_filter(self._wb_records[seq])][-self.capture_display_limit:]
+            pinned_ids = {r["seq"] for r in pinned}
+            remaining = self.capture_display_limit - len(pinned)
+            tail = [r for r in candidates if r["seq"] not in pinned_ids]
+            visible = sorted([*pinned, *(tail[-remaining:] if remaining else [])], key=lambda r: int(r["seq"]))
             for record in visible:
                 if record.get("direction") == "TX":
                     self.capture_visible_tx_count += 1
@@ -3392,10 +3449,10 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
                     tags=tags,
                 )
                 sequence_items[int(record["seq"])] = item
-            if selected_sequence is not None and selected_sequence in sequence_items:
-                selected_item = sequence_items[selected_sequence]
-                self.capture_tree.selection_set(selected_item)
-                self.capture_tree.focus(selected_item)
+            selected_items = tuple(sequence_items[seq] for seq in selected_sequences if seq in sequence_items)
+            if selected_items:
+                self.capture_tree.selection_set(selected_items)
+                self.capture_tree.focus(sequence_items.get(selected_sequence, selected_items[0]))
         finally:
             self.capture_tree.end_update()
         if follow_tail:
@@ -3404,6 +3461,16 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
             self.capture_tree.yview("moveto", previous_view[0])
         self._capture_display_dirty = False
         self._update_capture_summary()
+
+    def _capture_user_yview(self, *args) -> None:
+        self.capture_tree.yview(*args)
+        self._capture_user_scrolled()
+
+    def _capture_user_scrolled(self) -> None:
+        # Only an explicit user scroll to the bottom resumes tail following.
+        # Programmatic centering must not undo a navigation hold.
+        self._capture_follow_suspended = not self.capture_tree.is_at_bottom()
+        self._update_capture_refresh_state()
 
     def _capture_selected_sequence(self) -> int | None:
         selection = self.capture_tree.selection()
@@ -3422,18 +3489,26 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
         item = self.capture_tree.identify_row(event.y)
         if not item:
             return "break"
-        self.capture_tree.selection_set(item)
+        if item not in self.capture_tree.selection():
+            self.capture_tree.selection_set(item)
         self.capture_tree.focus(item)
         self.capture_context_item = item
         self.capture_context_column = self.capture_tree.identify_column(event.x)
 
-        record = self._wb_current_record()
+        record = self._capture_context_record()
         snapshot = dict(record) if record else None
         menu = tk.Menu(self, tearoff=False)
         menu.add_command(label="查看报文详情…", command=lambda: self._capture_show_details(record=snapshot),
                          state="normal" if snapshot else "disabled")
         menu.add_command(label="载入 Raw 注入", command=lambda: self._capture_reuse_frame(snapshot),
                          state="normal" if snapshot else "disabled")
+        menu.add_command(label="查找相同 Opcode", command=lambda: self._wb_find_same_opcode(snapshot),
+                         state="normal" if snapshot and (snapshot.get("opcode") is not None
+                                                          or snapshot.get("is_poll") is not False) else "disabled")
+        menu.add_separator()
+        menu.add_command(label="批量提取/导出选中行…", command=lambda: self._files_choose_export(scope="SELECTED"))
+        menu.add_command(label="上一非法数据块", command=lambda: self._files_navigate_error(-1))
+        menu.add_command(label="下一非法数据块", command=lambda: self._files_navigate_error(1))
         menu.add_separator()
         menu.add_command(label="复制当前单元格", command=self._copy_capture_cell)
         menu.add_command(label="复制整行（TSV）", command=self._copy_capture_current_row)
@@ -3570,9 +3645,18 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
         self._copy_to_clipboard(value)
 
     def _copy_capture_current_row(self, _event=None) -> str:
+        selection = self.capture_tree.selection()
+        if len(selection) > 1:
+            self._copy_to_clipboard("\n".join("\t".join(self._capture_clean_display_values(
+                self.capture_tree.item(item, "values"))) for item in selection))
+            return "break"
         context = self._capture_context_values()
         if context is not None:
             self._copy_to_clipboard("\t".join(self._capture_clean_display_values(context[1])))
+        return "break"
+
+    def _capture_select_all(self, _event=None) -> str:
+        self.capture_tree.selection_set(self.capture_tree.get_children())
         return "break"
 
     def _copy_capture_current_row_with_header(self) -> None:
@@ -3652,7 +3736,11 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
             ("注释", annotation.get("note") or "—"),
         )
         groups = (fields[:8], fields[8:11], fields[11:15], fields[15:])
-        return "\n\n".join("\n".join(f"{label}：{value}" for label, value in group) for group in groups)
+        content = "\n\n".join("\n".join(f"{label}：{value}" for label, value in group) for group in groups)
+        content += f"\n\n长度检查：{record.get('length_status', 'NOT_COVERED')}\n{record.get('length_message', '暂无检查结果')}"
+        if "origin_seq" in record:
+            content += f"\n\n离线导入前编号：{record['origin_seq']}\n原会话：{record.get('origin_capture_session_id') or '—'}"
+        return content
 
     def _capture_show_details(self, event=None, *, record: dict | None = None) -> tk.Toplevel | None:
         if event is not None:
@@ -3720,31 +3808,10 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
         self.status_var.set(f"消息 #{record.get('seq', '')} 已载入 Raw 注入，待手动发送")
 
     def _export_capture_csv(self) -> None:
-        path = filedialog.asksaveasfilename(title="导出 CEC 抓包 CSV", defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("所有文件", "*.*")])
-        if not path:
-            return
-        fields = [
-            "seq", "time", "timestamp_ms", "direction", "frame", "source", "destination",
-            "frame_bytes", "theoretical_duration_ms", "callback_interval_ms", "estimated_gap_ms",
-            "opcode_text", "opcode_explanation", "params", "params_explanation", "status",
-            "capture_session_id", "bookmark", "note", "tags",
-        ]
-        try:
-            with Path(path).open("w", newline="", encoding="utf-8-sig") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(dict(row, tags=", ".join(row.get("tags", []))) for row in self._wb_export_records())
-        except OSError as exc:
-            messagebox.showerror(APP_NAME, f"导出抓包失败：\n{exc}")
+        self._files_choose_export(scope="ALL", format_name="CSV", full=True)
 
     def _export_capture_json(self) -> None:
-        path = filedialog.asksaveasfilename(title="导出 CEC 抓包 JSON", defaultextension=".json", filetypes=[("JSON", "*.json"), ("所有文件", "*.*")])
-        if not path:
-            return
-        try:
-            self.log_writer.replace_json(path, self._wb_export_records())
-        except OSError as exc:
-            messagebox.showerror(APP_NAME, f"导出抓包失败：\n{exc}")
+        self._files_choose_export(scope="ALL", format_name="JSON", full=True)
 
     def _append_scenario_log(self, text: str) -> None:
         self.scenario_log.configure(state="normal")
@@ -3753,6 +3820,7 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
         self.scenario_log.configure(state="disabled")
 
     def _run_scenario(self) -> None:
+        self._files_show_live()
         if self.scenario_running:
             messagebox.showinfo(APP_NAME, "场景已经在运行。")
             return
@@ -4863,6 +4931,9 @@ class CECClientGUI(CaptureWorkbenchMixin, tk.Tk):
 
     def destroy(self) -> None:
         self._closing = True
+        if getattr(self, "_files_load_job", None) is not None:
+            self.after_cancel(self._files_load_job)
+            self._files_load_job = None
         if getattr(self, "_wb_highlight_save_job", None) is not None:
             self.after_cancel(self._wb_highlight_save_job)
             self._wb_highlight_save_job = None

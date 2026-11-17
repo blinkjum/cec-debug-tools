@@ -187,6 +187,32 @@ class CaptureQuery:
     text: str = ""
     bookmarks_only: bool = False
 
+    @property
+    def has_conditions(self) -> bool:
+        return bool(self.sources or self.destinations or self.opcodes or self.status
+                    or self.parameters or self.text or self.bookmarks_only)
+
+    def describe(self) -> str:
+        parts = []
+        for label, values, width in (("源LA", self.sources, 1), ("目标LA", self.destinations, 1),
+                                     ("Opcode", self.opcodes, 2)):
+            if values:
+                raw = [f"{value:0{width}X}" for value in sorted(v for v in values if v is not None)]
+                if None in values:
+                    raw.append("POLL")
+                parts.append(f"{label}={','.join(raw)}")
+        if self.status:
+            parts.append(f"状态={self.status}")
+        if self.parameters:
+            tokens = ["".join(f"{(value >> shift) & 15:X}" if mask & (15 << shift) else "?"
+                              for shift in (4, 0)) for mask, value in self.parameters]
+            parts.append("参数=" + ":".join(tokens))
+        if self.text:
+            parts.append(f"文字={self.text}")
+        if self.bookmarks_only:
+            parts.append("仅书签")
+        return "；".join(parts)
+
     @classmethod
     def from_dict(cls, data: dict) -> "CaptureQuery":
         status = str(data.get("status", "")).strip().upper()
@@ -198,9 +224,14 @@ class CaptureQuery:
                    bool(data.get("bookmarks_only", False)))
 
     def matches(self, record: dict, annotation: dict | None = None) -> bool:
-        if self.sources and hex_value(record.get("source", ""), 15) not in self.sources:
+        try:
+            if self.sources and hex_value(record.get("source", ""), 15) not in self.sources:
+                return False
+            if self.destinations and hex_value(record.get("destination", ""), 15) not in self.destinations:
+                return False
+        except ValueError:
             return False
-        if self.destinations and hex_value(record.get("destination", ""), 15) not in self.destinations:
+        if self.opcodes and record.get("opcode") is None and record.get("is_poll") is False:
             return False
         if self.opcodes and record.get("opcode") not in self.opcodes:
             return False
@@ -220,7 +251,7 @@ class CaptureQuery:
             haystack = " ".join(str(record.get(key, "")) for key in (
                 "frame", "source", "destination", "opcode_text", "opcode_explanation", "frame_bytes",
                 "theoretical_duration_ms", "callback_interval_ms", "estimated_gap_ms", "params",
-                "params_explanation", "status"))
+                "params_explanation", "status", "length_status", "length_message"))
             haystack += " " + str(annotation.get("note", "")) + " " + " ".join(annotation.get("tags", []))
             if self.text not in haystack.casefold():
                 return False

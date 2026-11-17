@@ -32,7 +32,9 @@ class CaptureWorkbenchMixin:
         self._wb_panel_name = ""
         self._wb_loading_quick = False
         self._wb_search_seq = None
-        self._wb_applied_mode = "FILTER"
+        self._wb_applied_mode = "FIND"
+        self._wb_query_valid = True
+        self._capture_follow_suspended = False
         self._wb_notes_error = ""
         self._wb_highlight_save_job = None
         self._wb_persist_highlights = read_settings
@@ -64,9 +66,11 @@ class CaptureWorkbenchMixin:
                                  if isinstance(v, dict)} if isinstance(prefs.get("filter_presets", {}), dict) else {}
         self.wb_query_vars = {name: tk.StringVar() for name in ("source", "destination", "opcode", "status", "params")}
         self.wb_bookmarks_only = tk.BooleanVar(value=False)
-        self.wb_mode_var = tk.StringVar(value="FILTER")
+        self.wb_mode_var = tk.StringVar(value="FIND")
+        self.wb_only_matches_var = tk.BooleanVar(value=False)
         self.wb_preset_var = tk.StringVar()
-        self.wb_search_status = tk.StringVar(value="匹配 0 条")
+        self.wb_search_status = tk.StringVar(value="未设置查找条件")
+        self.wb_search_summary = tk.StringVar()
         self.wb_query_status = tk.StringVar(value="所有条件按 AND 组合；LA/Opcode可用逗号列出多个值")
         self.wb_note_preview = tk.StringVar(value="右键消息可添加书签、注释和标签；F2 / Shift+F2 跳转标记")
         self.wb_scope_var = tk.StringVar(value="全部会话")
@@ -76,23 +80,34 @@ class CaptureWorkbenchMixin:
         self.wb_release_var = tk.BooleanVar(value=False)
         self.wb_quick_preview = tk.StringVar()
         self.wb_query = CaptureQuery()
+        self._files_init()
+        for var in (*self.wb_query_vars.values(), self.wb_bookmarks_only, self.capture_filter_var):
+            var.trace_add("write", lambda *_: self._wb_schedule_query())
+        self.wb_mode_var.trace_add("write", lambda *_: self._wb_mode_changed())
 
     def _wb_preferences(self) -> dict:
         return {"quick_commands": [x.to_dict() for x in self.wb_commands],
-                "filter_presets": self.wb_filter_presets}
+                "filter_presets": self.wb_filter_presets, "capture_files": self._files_preferences()}
 
     def _wb_create(self, parent, toolbar, combo_class, opcode_options) -> None:
         self._wb_combo = combo_class
         self._wb_opcode_options = opcode_options
         controls = ttk.Frame(parent)
         controls.grid(row=2, column=0, sticky="ew", pady=(0, 3))
-        pages = ("快捷命令", "组合查找", "书签注释", "Opcode 关注")
+        pages = ("快捷命令", "组合查找", "书签注释", "Opcode 关注", "日志工具")
         for name in pages:
-            ttk.Button(controls, text=name, command=lambda page=name: self._wb_toggle(page)).pack(side="left", padx=(0, 4))
-        ttk.Button(controls, text="上一命中", command=lambda: self._wb_navigate(-1)).pack(side="left", padx=2)
-        ttk.Button(controls, text="下一命中", command=lambda: self._wb_navigate(1)).pack(side="left", padx=2)
-        ttk.Label(controls, textvariable=self.wb_search_status).pack(side="left", padx=8)
-        ttk.Button(controls, text="返回最新", command=self._wb_latest).pack(side="right")
+            ttk.Button(controls, text=name, width=0, command=lambda page=name: self._wb_toggle(page)).pack(side="left", padx=(0, 4))
+        self.wb_previous_button = ttk.Button(controls, text="上一命中", width=0, state="disabled", command=lambda: self._wb_navigate(-1))
+        self.wb_previous_button.pack(side="left", padx=2)
+        self.wb_next_button = ttk.Button(controls, text="下一命中", width=0, state="disabled", command=lambda: self._wb_navigate(1))
+        self.wb_next_button.pack(side="left", padx=2)
+        self.wb_only_matches_button = ttk.Checkbutton(controls, text="仅显示匹配", variable=self.wb_only_matches_var,
+                                                     command=self._wb_toggle_only_matches, state="disabled")
+        self.wb_only_matches_button.pack(side="left", padx=5)
+        self.wb_latest_button = ttk.Button(controls, text="返回最新", width=0, command=self._wb_latest)
+        self.wb_latest_button.pack(side="right")
+        ttk.Label(controls, textvariable=self.wb_search_status).pack(side="right", padx=6)
+        ttk.Label(controls, textvariable=self.wb_search_summary, width=1).pack(side="left", fill="x", expand=True, padx=3)
         self.wb_panel = ttk.Notebook(parent, height=244)
         self.wb_panel.grid(row=4, column=0, sticky="ew", pady=(3, 0))
         self.wb_pages = {name: ttk.Frame(self.wb_panel, padding=4) for name in pages}
@@ -102,6 +117,7 @@ class CaptureWorkbenchMixin:
         self._wb_create_search(self.wb_pages["组合查找"])
         self._wb_create_notes(self.wb_pages["书签注释"])
         self._wb_create_highlights(self.wb_pages["Opcode 关注"])
+        self._files_create(self.wb_pages["日志工具"])
         self.wb_panel.grid_remove()
 
     def _wb_create_highlights(self, parent) -> None:
@@ -479,6 +495,8 @@ class CaptureWorkbenchMixin:
             self.output_queue.put(("wb_done", command.name))
 
     def _wb_handle_output(self, kind: str, value) -> bool:
+        if self._files_handle_output(kind, value):
+            return True
         if kind == "wb_command":
             command, result = value
             self._add_history(command)
@@ -518,9 +536,7 @@ class CaptureWorkbenchMixin:
             else:
                 ttk.Entry(parent, textvariable=self.wb_query_vars[key]).grid(row=row, column=col+1, sticky="ew", padx=3)
         ttk.Checkbutton(parent, text="仅书签", variable=self.wb_bookmarks_only).grid(row=1, column=4, sticky="w")
-        self._wb_combo(parent, raw_variable=self.wb_mode_var,
-                       options=[("FILTER", "筛选列表"), ("FIND", "仅定位，保留列表")], width=20,
-                       state="readonly").grid(row=1, column=5, sticky="ew", padx=3)
+        ttk.Label(parent, text="默认保留上下文；勾选上方“仅显示匹配”可筛选", foreground="#555555").grid(row=1, column=5, sticky="w", padx=3)
         actions = ttk.Frame(parent)
         actions.grid(row=2, column=0, columnspan=6, sticky="w", pady=7)
         ttk.Button(actions, text="应用条件", command=self._wb_apply_query).pack(side="left")
@@ -532,7 +548,7 @@ class CaptureWorkbenchMixin:
         self.wb_preset_combo.bind("<<ComboboxSelected>>", lambda _e: self._wb_load_filter())
         ttk.Button(actions, text="保存条件", command=self._wb_save_filter).pack(side="left", padx=4)
         ttk.Button(actions, text="删除条件", command=self._wb_delete_filter).pack(side="left")
-        ttk.Label(parent, textvariable=self.wb_query_status, foreground="#555555").grid(row=3, column=0, columnspan=6, sticky="w", pady=4)
+        ttk.Label(parent, textvariable=self.wb_query_status, foreground="#555555", wraplength=950).grid(row=3, column=0, columnspan=6, sticky="w", pady=4)
         ttk.Label(parent, text="参数按前缀匹配：?? 任意字节、A? 任意低半字节，例如 01:??:A?。顶部文字同时搜索报文、解释、注释和标签。\nCtrl+F 打开；F3 / Shift+F3 前后定位，命中可跨越2000条显示窗口。", foreground="#555555", wraplength=1020).grid(row=4, column=0, columnspan=6, sticky="w", pady=3)
 
     def _wb_query_data(self) -> dict:
@@ -540,9 +556,19 @@ class CaptureWorkbenchMixin:
                 "bookmarks_only": self.wb_bookmarks_only.get(), "mode": self.wb_mode_var.get()}
 
     def _wb_schedule_query(self, _event=None) -> None:
+        if not hasattr(self, "capture_tree"):
+            return
         if self._wb_query_job is not None:
             self.after_cancel(self._wb_query_job)
         self._wb_query_job = self.after(180, self._wb_apply_query)
+
+    def _wb_mode_changed(self) -> None:
+        self.wb_only_matches_var.set(self.wb_mode_var.get() == "FILTER")
+        self._wb_schedule_query()
+
+    def _wb_toggle_only_matches(self) -> None:
+        self.wb_mode_var.set("FILTER" if self.wb_only_matches_var.get() else "FIND")
+        self._wb_apply_query()
 
     def _wb_apply_query(self) -> bool:
         if self._wb_query_job is not None:
@@ -551,20 +577,35 @@ class CaptureWorkbenchMixin:
         try:
             query = CaptureQuery.from_dict(self._wb_query_data())
         except ValueError as exc:
+            self._wb_query_valid = False
+            if self.wb_mode_var.get() != self._wb_applied_mode:
+                self.wb_mode_var.set(self._wb_applied_mode)
             self.wb_query_status.set(f"条件未应用：{exc}")
-            return False
-        changed = query != self.wb_query or self.wb_mode_var.get() != self._wb_applied_mode
-        self.wb_query = query
-        self._wb_applied_mode = self.wb_mode_var.get()
-        if None in query.opcodes:
-            changed = changed or not self.capture_show_poll_var.get()
-            self.capture_show_poll_var.set(True)
-        if changed:
-            self._wb_rebuild_matches()
-            self._refresh_capture_tree(force=True)
-        else:
+            self._wb_search_dirty = True
             self._wb_update_search_status()
-        self.wb_query_status.set("条件已应用；" + ("仅定位，不隐藏其他消息" if self._wb_applied_mode == "FIND" else "列表显示匹配消息"))
+            return False
+        self._wb_query_valid = True
+        mode = self.wb_mode_var.get() if query.has_conditions else "FIND"
+        if self.wb_mode_var.get() != mode:
+            self.wb_mode_var.set(mode)
+        changed = query != self.wb_query
+        # Updating FIND criteria never changes the displayed rows or scroll position.
+        refresh = mode != self._wb_applied_mode or (mode == "FILTER" and query != self.wb_query)
+        self.wb_query = query
+        self._wb_applied_mode = mode
+        if None in query.opcodes:
+            refresh = refresh or not self.capture_show_poll_var.get()
+            self.capture_show_poll_var.set(True)
+        if changed or refresh:
+            self._wb_rebuild_matches()
+        else:
+            self._wb_search_dirty = True
+            self._wb_update_search_status()
+        if refresh:
+            self._refresh_capture_tree(force=True)
+        self.wb_query_status.set(("查找：" + query.describe() + "；" +
+                                 ("保留上下文，F3 / Shift+F3 定位" if mode == "FIND" else "仅显示匹配消息"))
+                                if query.has_conditions else "未设置查找条件；填写条件或右键消息→查找相同 Opcode")
         return True
 
     def _wb_base_changed(self) -> None:
@@ -573,8 +614,10 @@ class CaptureWorkbenchMixin:
         self._refresh_capture_tree()
 
     def _wb_base_matches(self, record: dict) -> bool:
-        return (record.get("opcode") is not None or self.capture_show_poll_var.get()) and (
-            self.capture_direction_var.get() == "ALL" or record.get("direction") == self.capture_direction_var.get())
+        return (record.get("opcode") is not None or self.capture_show_poll_var.get()
+                or record.get("length_status") == "ERROR") and (
+            self.capture_direction_var.get() == "ALL" or record.get("direction") == self.capture_direction_var.get()) and (
+            not self._files_errors_only.get() or record.get("length_status") == "ERROR")
 
     def _wb_annotation(self, record: dict) -> dict:
         return self.wb_annotations.get(self.capture_session_id, int(record["seq"]))
@@ -583,13 +626,15 @@ class CaptureWorkbenchMixin:
         return self._wb_base_matches(record) and self.wb_query.matches(record, self._wb_annotation(record))
 
     def _wb_rebuild_matches(self) -> None:
-        self._wb_matches = [int(r["seq"]) for r in self.capture_records if self._wb_matches_record(r)]
+        self._wb_matches = ([int(r["seq"]) for r in self.capture_records if self._wb_matches_record(r)]
+                            if self.wb_query.has_conditions else [])
         self._wb_search_dirty = True
         self._wb_update_search_status()
 
     def _wb_on_record(self, record: dict) -> None:
+        self._files_record_added(record)
         self._wb_records[int(record["seq"])] = record
-        if self._wb_matches_record(record):
+        if self.wb_query.has_conditions and self._wb_matches_record(record):
             self._wb_matches.append(int(record["seq"]))
         self._wb_search_dirty = True
 
@@ -598,9 +643,16 @@ class CaptureWorkbenchMixin:
             return
         seq = self._capture_selected_sequence() if hasattr(self, "capture_tree") else None
         index = bisect.bisect_left(self._wb_matches, seq) if seq is not None else 0
-        position = f"；第 {index+1} 条" if seq is not None and index < len(self._wb_matches) and self._wb_matches[index] == seq else ""
-        mode = "筛选" if self._wb_applied_mode == "FILTER" else "定位"
-        self.wb_search_status.set(f"{mode}匹配 {len(self._wb_matches)} 条{position}")
+        position = f"第 {index+1} / " if seq is not None and index < len(self._wb_matches) and self._wb_matches[index] == seq else "匹配 "
+        active = self.wb_query.has_conditions and self._wb_query_valid
+        self.wb_search_status.set((f"{position}{len(self._wb_matches)} 条" if active else
+                                   "条件有误" if not self._wb_query_valid else "未设置查找条件"))
+        self.wb_search_summary.set(("筛选：" if self._wb_applied_mode == "FILTER" else "查找：") + self.wb_query.describe()
+                                   if self.wb_query.has_conditions else "右键消息可查找相同 Opcode")
+        if hasattr(self, "wb_previous_button"):
+            for button in (self.wb_previous_button, self.wb_next_button):
+                button.configure(state="normal" if active and self._wb_matches else "disabled")
+            self.wb_only_matches_button.configure(state="normal" if active else "disabled")
         self._wb_search_dirty = False
 
     def _wb_navigate(self, direction: int) -> None:
@@ -619,7 +671,14 @@ class CaptureWorkbenchMixin:
         if record is None:
             return
         items = {int(self.capture_tree.item(item, "values")[0]): item for item in self.capture_tree.get_children()}
-        if sequence not in items:
+        # A selected historical row can be pinned next to the newest tail.
+        # Restore neighbouring records as well when that isolated row is a hit.
+        offset = sequence - 1
+        if offset >= len(self.capture_records) or int(self.capture_records[offset]["seq"]) != sequence:
+            offset = next(i for i, row in enumerate(self.capture_records) if int(row["seq"]) == sequence)
+        nearby = self.capture_records[max(0, offset-5):offset+6]
+        missing_context = any(self._capture_record_matches_filter(row) and int(row["seq"]) not in items for row in nearby)
+        if sequence not in items or missing_context:
             records = [r for r in self.capture_records if self._capture_record_matches_filter(r) or int(r["seq"]) == sequence]
             index = next(i for i, r in enumerate(records) if int(r["seq"]) == sequence)
             start = min(max(0, index-self.capture_display_limit//2), max(0, len(records)-self.capture_display_limit))
@@ -640,22 +699,40 @@ class CaptureWorkbenchMixin:
                 self.capture_tree.end_update()
             self._update_capture_summary()
         item = items[sequence]
+        self._capture_follow_suspended = True
         self.capture_tree.selection_set(item)
         self.capture_tree.focus(item)
-        self.capture_tree.see(item)
+        self.capture_tree.see(item, center=True)
         self._wb_selection_changed()
+        self._update_capture_refresh_state()
 
     def _wb_latest(self) -> None:
+        self._files_show_live()
+        self._capture_follow_suspended = False
         self.capture_paused_var.set(False)
         self._refresh_capture_tree(force=True)
         self.capture_tree.see_end()
+        self._update_capture_refresh_state()
 
     def _wb_clear_query(self) -> None:
         for var in self.wb_query_vars.values():
             var.set("")
         self.capture_filter_var.set("")
         self.wb_bookmarks_only.set(False)
+        self.wb_mode_var.set("FIND")
         self._wb_apply_query()
+
+    def _wb_find_same_opcode(self, record: dict | None) -> None:
+        if not record or (record.get("opcode") is None and record.get("is_poll") is False):
+            return
+        for var in self.wb_query_vars.values():
+            var.set("")
+        self.capture_filter_var.set("")
+        self.wb_bookmarks_only.set(False)
+        self.wb_mode_var.set("FIND")
+        self.wb_query_vars["opcode"].set(f"{record['opcode']:02X}" if record.get("opcode") is not None else "POLL")
+        if self._wb_apply_query():
+            self._wb_jump(int(record["seq"]))
 
     def _wb_save_filter(self) -> None:
         if not self._wb_apply_query():
@@ -674,7 +751,7 @@ class CaptureWorkbenchMixin:
                 var.set(data.get(key, ""))
             self.capture_filter_var.set(data.get("text", ""))
             self.wb_bookmarks_only.set(bool(data.get("bookmarks_only")))
-            self.wb_mode_var.set(data.get("mode", "FILTER"))
+            self.wb_mode_var.set(data.get("mode", "FIND"))
             self._wb_apply_query()
 
     def _wb_delete_filter(self) -> None:
@@ -706,7 +783,7 @@ class CaptureWorkbenchMixin:
         self.wb_notes_tree.configure(yscrollcommand=scrollbar.set)
         self.wb_notes_tree.bind("<Double-1>", lambda _e: self._wb_note_jump())
         ttk.Label(parent, textvariable=self.wb_note_preview, foreground="#555555", wraplength=1100).grid(row=2, column=0, sticky="w", pady=3)
-        ttk.Label(parent, text=f"自动保存：{self.wb_annotations_path}", foreground="#666666").grid(row=3, column=0, sticky="w")
+        ttk.Label(parent, textvariable=self._files_notes_path_var, foreground="#666666").grid(row=3, column=0, sticky="w")
 
     def _wb_refresh_notes(self) -> None:
         if not hasattr(self, "wb_notes_tree"):
@@ -740,9 +817,8 @@ class CaptureWorkbenchMixin:
 
     def _wb_record_mark(self, record: dict) -> str:
         annotation = self._wb_annotation(record)
-        if annotation.get("bookmark"):
-            return "★"
-        return "✎" if annotation.get("note") or annotation.get("tags") else ""
+        mark = "★" if annotation.get("bookmark") else "✎" if annotation.get("note") or annotation.get("tags") else ""
+        return mark + ("!" if record.get("length_status") == "ERROR" else "")
 
     def _wb_toggle_bookmark(self) -> None:
         record = self._wb_current_record()
@@ -830,6 +906,8 @@ class CaptureWorkbenchMixin:
         self.capture_session_id = uuid4().hex
         self._wb_records.clear()
         self._wb_matches.clear()
+        self._capture_follow_suspended = False
+        self._files_clear_context()
         self._wb_search_dirty = True
         self.wb_note_preview.set("已开始新会话；旧书签和注释保留在“全部会话”")
         self._wb_update_search_status()

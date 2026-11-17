@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import sys
 import traceback
+import tempfile
+import time
 
 from runtime_paths import application_directory
 
@@ -56,6 +58,21 @@ def run_self_test(gui_class, report_path: Path) -> int:
         app.wb_query_vars["opcode"].set("90")
         if not app._wb_apply_query() or app._wb_matches != [1]:
             raise RuntimeError("Packaged compound query check failed")
+        command = backend.frame_to_command([0x50, 0x7A, 0x20])
+        backend._callbacks.rawFrame(None, ctypes.byref(command), 0, 1, 200)
+        app._poll_output()
+        if app._wb_applied_mode != "FIND" or len(app.capture_tree.get_children()) != 2:
+            raise RuntimeError("Packaged search did not retain unmatched context")
+        app._wb_navigate(1)
+        if app._capture_selected_sequence() != 1 or not app._capture_follow_suspended:
+            raise RuntimeError("Packaged search navigation did not hold its position")
+        app.wb_only_matches_button.invoke()
+        if len(app.capture_tree.get_children()) != 1 or app._wb_applied_mode != "FILTER":
+            raise RuntimeError("Packaged optional match filter failed")
+        app.wb_only_matches_button.invoke()
+        if len(app.capture_tree.get_children()) != 2:
+            raise RuntimeError("Packaged optional match filter did not restore context")
+        report["search_context_navigation"] = True
         app.wb_annotations.set(app.capture_session_id, app.capture_records[0], bookmark=True,
                                note="offline check", tags=["selftest"])
         if app._wb_export_records()[0]["note"] != "offline check":
@@ -92,6 +109,31 @@ def run_self_test(gui_class, report_path: Path) -> int:
             raise RuntimeError("Packaged Raw load did not populate the frame")
         report["capture_details"] = True
         report["raw_frame_loaded"] = app.raw_frame_var.get()
+        from cec_capture_tools import read_capture_file
+        with tempfile.TemporaryDirectory(prefix="offline-check-", dir=application_directory()) as scratch:
+            folder = Path(scratch)
+            app.settings_path = folder / "settings.json"
+            app.wb_annotations_path = folder / "bookmarks.json"
+            packet_file = folder / "离线 抓包.json"
+            packet_file.write_text(json.dumps([{"seq": 33, "frame": "50:90", "note": "离线自检"},
+                                               {"seq": 34, "frame": "05", "timestamp_ms": 123}]), encoding="utf-8")
+            app._files_load(packet_file)
+            deadline = time.monotonic() + 15
+            while app._files_load_busy and time.monotonic() < deadline:
+                app.update()
+                time.sleep(0.005)
+            if app._files_mode != "OFFLINE" or app._files_errors != [1] or app.gui_error_count:
+                raise RuntimeError("Packaged offline import or length check failed")
+            exported = folder / "提取.csv"
+            app._files_start_export(exported, app._files_extract_records("ALL"), "CSV", ["seq", "frame", "note"])
+            if not app.log_writer.flush(wait=True, timeout=15) or len(read_capture_file(exported).records) != 2:
+                raise RuntimeError("Packaged background batch export failed")
+            app._files_show_live()
+            if len(app.capture_records) != 2 or app.capture_records[0]["frame"] != "05:90:00":
+                raise RuntimeError("Packaged offline view did not retain live capture")
+            report["offline_import"] = True
+            report["length_check"] = True
+            report["batch_export"] = True
         report["ok"] = True
     except Exception:
         report["error"] = traceback.format_exc()
