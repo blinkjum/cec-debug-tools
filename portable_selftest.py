@@ -7,6 +7,7 @@ import sys
 import traceback
 import tempfile
 import time
+import zipfile
 
 from runtime_paths import application_directory
 
@@ -175,6 +176,42 @@ def run_self_test(gui_class, report_path: Path) -> int:
             report["offline_import"] = True
             report["length_check"] = True
             report["batch_export"] = True
+            bundle_path = folder / "AI 分析包.zip"
+            app._ai_show_export()
+            app._ai_window.withdraw()
+            app._ai_problem_combo.current(app._ai_problem_ids.index("NO_RESPONSE"))
+            app._ai_problem_changed()
+            operations = {key: widget.get("1.0", "end-1c") for key, widget in app._ai_note_widgets.items()}
+            operations.update(problem_preset="NO_RESPONSE", steps="便携版离线自检")
+            app._ai_start_export(bundle_path, operations)
+            if not app.log_writer.flush(wait=True, timeout=20) or not bundle_path.is_file():
+                raise RuntimeError("Packaged AI analysis export did not produce a ZIP")
+            with zipfile.ZipFile(bundle_path) as bundle:
+                expected = {"capture.json", "connection.json", "versions.json", "operation.md",
+                            "analysis_prompt.md", "README.md", "manifest.json"}
+                if set(bundle.namelist()) != expected:
+                    raise RuntimeError("Packaged AI analysis ZIP has incorrect contents")
+                records = json.loads(bundle.read("capture.json"))
+                versions = json.loads(bundle.read("versions.json"))
+                dll_info = versions["libcec_dll"]
+                if len(records) != 2 or records[0]["note"] != "offline check":
+                    raise RuntimeError("Packaged AI analysis lost complete records or annotations")
+                if not dll_info["loaded"] or dll_info["sha256"] != report["dll_sha256"] or not dll_info.get("product_version"):
+                    raise RuntimeError("Packaged AI analysis has incorrect native DLL provenance")
+                if Path(dll_info["path"]).resolve() != dll_path:
+                    raise RuntimeError("Packaged AI analysis used an external DLL identity")
+                manifest = json.loads(bundle.read("manifest.json"))
+                for name, identity in manifest["files"].items():
+                    if hashlib.sha256(bundle.read(name)).hexdigest() != identity["sha256"]:
+                        raise RuntimeError("Packaged AI analysis ZIP checksum mismatch")
+                if "便携版离线自检" not in bundle.read("operation.md").decode("utf-8"):
+                    raise RuntimeError("Packaged AI operation notes are not preserved")
+                if "请求无响应 / 响应超时" not in bundle.read("operation.md").decode("utf-8"):
+                    raise RuntimeError("Packaged CEC problem preset is missing")
+            app._drain_output_queue()
+            report["ai_bundle_export"] = True
+            report["ai_bundle_dll_version"] = dll_info["product_version"]
+            report["ai_problem_presets"] = len(app._ai_problem_ids) - 1
         report["ok"] = True
     except Exception:
         report["error"] = traceback.format_exc()

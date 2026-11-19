@@ -14,13 +14,15 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from cec_capture_tools import (CHECK_LABELS, EXPORT_FIELDS, check_frame_length,
                                export_text, finite_number, parse_frame, read_capture_file)
 from cec_workbench import AnnotationLibrary
+from capture_ai_ui import CaptureAIExportMixin
 
 
-class CaptureFilesMixin:
+class CaptureFilesMixin(CaptureAIExportMixin):
     def _files_init(self) -> None:
         workbench = self.settings.get("workbench", {})
         prefs = workbench.get("capture_files", {}) if isinstance(workbench, dict) else {}
         prefs = prefs if isinstance(prefs, dict) else {}
+        self._ai_init(prefs)
         self._files_mode = "LIVE"
         self._files_path = None
         self._files_errors = []
@@ -44,7 +46,8 @@ class CaptureFilesMixin:
 
     def _files_preferences(self) -> dict:
         return {"scope": self._files_scope_var.get(), "format": self._files_format_var.get(),
-                "fields": [key for key, var in self._files_field_vars.items() if var.get()]}
+                "fields": [key for key, var in self._files_field_vars.items() if var.get()],
+                "ai_export": dict(self._ai_operations)}
 
     def _files_create(self, parent) -> None:
         parent.columnconfigure(0, weight=1)
@@ -265,6 +268,8 @@ class CaptureFilesMixin:
                 self._files_open_button.configure(state="normal")
 
     def _files_handle_output(self, kind: str, value) -> bool:
+        if self._ai_handle_output(kind, value):
+            return True
         if kind == "files_loaded":
             path, document, identity, notes_path, notes, error = value
             self._files_pending_load = dict(path=path, document=document, session=identity, annotations_path=notes_path,

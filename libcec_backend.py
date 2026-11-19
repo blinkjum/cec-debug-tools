@@ -8,6 +8,7 @@ thread-safe event queue and exposes a small, Python-friendly API to the UI.
 from __future__ import annotations
 
 import ctypes
+from copy import deepcopy
 import os
 import queue
 import threading
@@ -291,6 +292,8 @@ class LibCecBackend:
     def __init__(self, dll_path: str | os.PathLike[str] | None = None) -> None:
         self.dll_path = Path(dll_path) if dll_path else None
         self._lib: Any = None
+        self._loaded_dll_path: Path | None = None
+        self._cached_configuration: dict[str, Any] | None = None
         self._connection = ctypes.c_void_p()
         self._callbacks: IcecCallbacks | None = None
         self._callback_refs: list[Any] = []
@@ -324,6 +327,16 @@ class LibCecBackend:
     @property
     def load_error(self) -> str | None:
         return self._load_error
+
+    @property
+    def loaded_dll_path(self) -> Path | None:
+        """Actual loaded library; a subsequently edited DLL textbox is only a request."""
+        return self._loaded_dll_path
+
+    @property
+    def cached_configuration(self) -> dict[str, Any] | None:
+        """Copy callback metadata without querying the bus or acquiring a native lock."""
+        return deepcopy(self._cached_configuration)
 
     @staticmethod
     def bundled_dlls() -> list[Path]:
@@ -372,6 +385,7 @@ class LibCecBackend:
                 self._lib = ctypes.WinDLL(str(candidate))
                 self.dll_path = candidate
                 self._bind_functions()
+                self._loaded_dll_path = candidate.resolve()
                 self._load_error = None
                 return self._lib
             except (OSError, AttributeError) as exc:
@@ -539,7 +553,24 @@ class LibCecBackend:
                 self._put_event("error", text=f"libCEC command callback: {exc}")
 
         def configuration_changed(_param: Any, _config_ptr: Any) -> None:
-            self._put_event("configuration", text="libCEC configuration changed")
+            try:
+                if _config_ptr:
+                    config = _config_ptr.contents
+                    version = int(config.serverVersion)
+                    self._cached_configuration = {
+                        "reported_at_unix_ms": int(time.time() * 1000),
+                        "libcec_server_version": f"{version >> 16}.{(version >> 8) & 255}.{version & 255}" if version else None,
+                        "device_name": _decode_c_string(config.strDeviceName),
+                        "logical_addresses": [f"{la:X}" for la in range(16) if config.logicalAddresses.addresses[la]],
+                        "physical_address_hex": f"{int(config.iPhysicalAddress):04X}",
+                        "monitor_only": bool(config.bMonitorOnly),
+                        "firmware_version": int(config.iFirmwareVersion),
+                        "firmware_build_date": int(config.iFirmwareBuildDate),
+                        "adapter_type": int(config.adapterType),
+                    }
+                self._put_event("configuration", text="libCEC configuration changed")
+            except Exception as exc:
+                self._put_event("error", text=f"libCEC configuration callback: {exc}")
 
         def alert(_param: Any, alert_code: int, _parameter: LibCecParameter) -> None:
             self._put_event("alert", alert=int(alert_code), text=ALERT_NAMES.get(int(alert_code), f"alert {int(alert_code)}"))
@@ -625,6 +656,7 @@ class LibCecBackend:
             if not str(port).strip():
                 return BackendResult(False, "COM 端口不能为空")
             try:
+                self._cached_configuration = None
                 config = self._new_configuration(
                     role=role,
                     device_types=device_types,

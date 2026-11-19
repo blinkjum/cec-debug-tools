@@ -35,6 +35,7 @@ from cec_workbench_ui import CaptureWorkbenchMixin, LA_CHOICES
 from cec_workbench import HIGHLIGHT_PALETTE, HIGHLIGHT_RULE_COUNT
 from capture_files_ui import CaptureFilesMixin
 from cec_capture_tools import write_export
+from capture_ai_export import write_ai_package
 from capture_layout import CAPTURE_COLUMNS, CAPTURE_HEADINGS, MINIMUM_WIDTHS, PREFERRED_WIDTHS
 from capture_layout_ui import CaptureLayoutMixin
 from workspace_ui import WorkspaceUIMixin
@@ -996,6 +997,12 @@ class AsyncLogWriter:
         else:
             callback("文件写入队列已关闭")
 
+    def ai_package(self, path, records, context, operations, callback) -> None:
+        if not self._closed:
+            self._queue.put(("ai_package", (path, records, context, operations, callback)))
+        else:
+            callback("文件写入队列已关闭")
+
     def close(self, timeout: float = 3.0) -> None:
         if self._closed:
             return
@@ -1061,6 +1068,13 @@ class AsyncLogWriter:
                     path, records, kind, fields, callback = payload
                     try:
                         write_export(path, records, kind, fields)
+                        callback(None)
+                    except Exception as exc:
+                        callback(str(exc))
+                elif command == "ai_package":
+                    path, records, context, operations, callback = payload
+                    try:
+                        write_ai_package(path, records, context, operations)
                         callback(None)
                     except Exception as exc:
                         callback(str(exc))
@@ -1895,6 +1909,8 @@ class CECClientGUI(WorkspaceUIMixin, CaptureLayoutMixin, CaptureFilesMixin, Capt
         ttk.Button(toolbar, text="清空", command=self._clear_capture).pack(side=LEFT, padx=4)
         ttk.Button(toolbar, text="导出 CSV", command=self._export_capture_csv).pack(side=LEFT, padx=4)
         ttk.Button(toolbar, text="导出 JSON", command=self._export_capture_json).pack(side=LEFT, padx=4)
+        self._ai_export_button = ttk.Button(toolbar, text="导出 AI 分析包", command=self._ai_show_export)
+        self._ai_export_button.pack(side=LEFT, padx=4)
         ttk.Button(toolbar, text="重置列宽", command=self._reset_capture_columns).pack(side=LEFT, padx=4)
         self.capture_layout_button = ttk.Button(toolbar, text="列布局", command=self._layout_show_menu)
         self.capture_layout_button.pack(side=LEFT, padx=4)
